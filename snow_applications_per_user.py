@@ -101,7 +101,10 @@ def num(key, default, cast=float):
 
 CLIENT_ID = cfg("CLIENT_ID")
 CLIENT_SECRET = cfg("CLIENT_SECRET")
-REGION = cfg("REGION", "westeurope")
+REGION = (cfg("REGION", "westeurope") or "westeurope").strip().lower()
+if not REGION.replace("-", "").isalnum():
+    sys.exit(f"REGION '{REGION}' in the .env looks wrong - it should be like: westeurope")
+ALLOW_INCOMPLETE = cfg("ALLOW_INCOMPLETE", "false").lower() in ("true", "1", "yes")
 
 VENDOR_INCLUDE = text_list("VENDOR_INCLUDE")
 VENDOR_EXCLUDE = text_list("VENDOR_EXCLUDE")
@@ -135,6 +138,10 @@ DISCOVERY_TYPE_NAMES = {
     3: "SSO", 4: "Device", 7: "Browser verified", 8: "CASB",
 }
 NETWORK_ERRORS = (OSError, http.client.HTTPException)  # includes timeouts/resets
+
+
+class ConnectProblem(Exception):
+    """Login / network failure with a human-readable message."""
 
 
 class NotFound(Exception):
@@ -210,11 +217,32 @@ class SnowClient:
                 "client_id": CLIENT_ID,
                 "client_secret": CLIENT_SECRET,
             }).encode()
-            req = urllib.request.Request(
-                f"{BASE_URL}/idp/api/connect/token", data=body, method="POST",
-                headers={"Content-Type": "application/x-www-form-urlencoded"})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                self.token = json.load(resp)["access_token"]
+            last_error = None
+            for attempt in range(1, 7):        # ~1 minute of network trouble tolerated
+                req = urllib.request.Request(
+                    f"{BASE_URL}/idp/api/connect/token", data=body, method="POST",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"})
+                try:
+                    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                        self.token = json.load(resp)["access_token"]
+                    return
+                except urllib.error.HTTPError as e:
+                    if e.code in (400, 401, 403):
+                        raise ConnectProblem(
+                            f"Flexera rejected the login (HTTP {e.code}).\n"
+                            f"  Check CLIENT_ID and CLIENT_SECRET in {ENV_PATH}.")
+                    last_error = f"HTTP {e.code}"
+                except (urllib.error.URLError, OSError) as e:
+                    last_error = getattr(e, "reason", e)
+                wait = min(2 ** attempt, 20)
+                print(f"  Cannot reach {HOST} ({last_error}) - retrying in {wait}s ...")
+                time.sleep(wait)
+            raise ConnectProblem(
+                f"Could not reach {HOST} ({last_error}).\n"
+                "  Check that:\n"
+                "   - you are connected to the internet and to VPN / Zscaler\n"
+                f"   - REGION in the .env is correct (currently '{REGION}')\n"
+                f"   - {BASE_URL} opens in your browser")
 
     # --- transport: persistent connection per thread, urllib fallback ---
     def _connection(self):
@@ -506,14 +534,15 @@ def main():
         sys.exit(f"Fill in CLIENT_ID and CLIENT_SECRET in {ENV_PATH}")
 
     started = time.time()
+    print(f"Connecting to {BASE_URL} ...  (config: {ENV_PATH})")
+    limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
+    client = SnowClient(limiter)
+    print("Authenticated.")
+
     writer = OutputWriter(run_signature())
     if writer.resumed:
         print(f"Resuming the previous unfinished run: {len(writer.done)} pages / "
               f"{writer.rows_written} rows already saved - only missing pages will be fetched.")
-
-    limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
-    client = SnowClient(limiter)
-    print(f"Authenticated against {BASE_URL}  (config: {ENV_PATH})")
     print(f"  {MAX_WORKERS} threads | max {MAX_REQUESTS_PER_SECOND:g} requests/s | "
           f"{PAGE_SIZE} users per page")
     for label, inc, exc in [
@@ -665,8 +694,15 @@ def main():
                 queue.append((app_id, page + 1))
     finished.set()
 
-    # 5. Finish: rename the partial file to the real output name
-    saved = writer.finalize()
+    # 5. Finish: rename the partial file to the real output name - but only if
+    #    nothing is missing, so a network outage never leaves you a silently
+    #    incomplete report. A rerun then fetches just the missing pages.
+    if still_failed and not ALLOW_INCOMPLETE:
+        writer.f.close()
+        writer.p.close()
+        saved = False
+    else:
+        saved = writer.finalize()
 
     per_app = {}
     for app_id, kept in writer.kept_by_app.items():
@@ -686,11 +722,21 @@ def main():
         print("  Note: that is more rows than Excel can open (1,048,576). Load the CSV "
               "into Power BI, or narrow the filters.")
     if still_failed:
-        print(f"\nWARNING - {len(still_failed)} page(s) could not be read, "
-              f"so these apps are incomplete:")
-        for name, page, err in still_failed:
+        print(f"\nWARNING - {len(still_failed)} page(s) could not be read "
+              f"(first 10 shown):")
+        for name, page, err in still_failed[:10]:
             print(f"  {name} (page {page}): {err}")
+        if not ALLOW_INCOMPLETE:
+            print("\nThe report was NOT finalised because pages are missing. Everything "
+                  "downloaded so far is kept.\nCheck your network / VPN and run the script "
+                  "again - it will fetch only the missing pages.\n(If the same pages keep "
+                  "failing, set ALLOW_INCOMPLETE=true in the .env to save what you have.)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ConnectProblem as e:
+        sys.exit(f"\nERROR: {e}")
+    except KeyboardInterrupt:
+        sys.exit("\nStopped. Run the script again to continue where it left off.")
