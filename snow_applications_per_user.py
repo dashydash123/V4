@@ -5,12 +5,22 @@ One row per user-application, with include/exclude filters for vendor,
 publisher, application name and discovery type. All settings live in
 apps_per_user.env next to this script.
 
-How it works
+How it works (built for speed without tripping the tenant rate limit)
   1. GET /applications (all), keep apps passing the vendor / publisher /
      application filters.
-  2. For each kept app: GET /applications/{id}/users (1000 per page,
-     parallel across apps) = every user assigned to / using that app.
-  3. Apply the discovery-type filters per user-app row, write the CSV.
+  2. Fetch PAGE 1 of every kept app in parallel. That reveals how many
+     pages each app has.
+  3. Queue EVERY remaining page of EVERY app as its own job. Worker
+     threads pull pages from that queue, so a huge app (100+ pages) is
+     spread across all threads instead of blocking one thread for ages.
+  4. One shared rate limiter caps requests/second across all threads.
+     On HTTP 429 every thread pauses and the rate is halved; it then
+     creeps back up while requests succeed.
+  5. HTTPS connections are kept alive per thread (no new TLS handshake
+     per call). If that fails on your network it falls back automatically.
+  6. Pages that still fail are retried one at a time at the end; the
+     final summary names any app whose data is incomplete.
+  A progress line is printed every 15 seconds, so you can see it working.
 
 Run:
     python snow_applications_per_user.py
@@ -21,8 +31,10 @@ on every run. Standard library only - no pip installs needed.
 """
 
 import csv
+import http.client
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -40,9 +52,9 @@ def load_env_file(path):
     values = {}
     if not os.path.exists(path):
         sys.exit(f"Config file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
-            line = line.strip()
+            line = line.replace("\u00a0", " ").strip()  # survive copy-paste spaces
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
@@ -71,6 +83,13 @@ def int_list(key):
     return out
 
 
+def num(key, default, cast=float):
+    try:
+        return cast(cfg(key, str(default)) or default)
+    except ValueError:
+        return default
+
+
 CLIENT_ID = cfg("CLIENT_ID")
 CLIENT_SECRET = cfg("CLIENT_SECRET")
 REGION = cfg("REGION", "westeurope")
@@ -87,30 +106,91 @@ DISCOVERY_TYPE_EXCLUDE = set(int_list("DISCOVERY_TYPE_EXCLUDE"))
 OUTPUT_FILE = cfg("OUTPUT_FILE", "ApplicationsPerUser.csv") or "ApplicationsPerUser.csv"
 if not os.path.isabs(OUTPUT_FILE):
     OUTPUT_FILE = os.path.join(SCRIPT_DIR, OUTPUT_FILE)
-MAX_WORKERS = int(cfg("MAX_WORKERS", "8") or 8)
+
+MAX_WORKERS = num("MAX_WORKERS", 8, int)
+MAX_REQUESTS_PER_SECOND = num("MAX_REQUESTS_PER_SECOND", 6.0)
+REQUEST_TIMEOUT = num("REQUEST_TIMEOUT", 60.0)
+KEEP_ALIVE = cfg("KEEP_ALIVE", "true").lower() not in ("false", "0", "no")
 # ====================================================================
 
-BASE_URL = f"https://{REGION}.snowsoftware.io"
+HOST = f"{REGION}.snowsoftware.io"
+BASE_URL = f"https://{HOST}"
 CV = "api/saas/consolidated-view/v1"
 PAGE_SIZE = 1000
+MAX_RETRIES = 12
 DISCOVERY_TYPE_NAMES = {
     0: "SaaS connector", 1: "Manually added", 2: "Browser unverified",
     3: "SSO", 4: "Device", 7: "Browser verified", 8: "CASB",
 }
+NETWORK_ERRORS = (OSError, http.client.HTTPException)  # includes timeouts/resets
 
 
 class NotFound(Exception):
     pass
 
 
-class SnowClient:
-    def __init__(self):
-        self.token = None
+# ------------------------- adaptive rate limiter -------------------------
+class RateLimiter:
+    """Spaces requests evenly across ALL threads; slows down on 429."""
+
+    def __init__(self, max_rate):
+        self.max_rate = max(1.0, max_rate)
+        self.rate = self.max_rate
+        self.min_rate = 1.0
         self.lock = threading.Lock()
+        self.next_slot = 0.0
+        self.paused_until = 0.0
+        self.last_cut = 0.0
+        self.successes = 0
+        self.throttle_count = 0
+
+    def acquire(self):
+        with self.lock:
+            now = time.time()
+            start = max(now, self.next_slot, self.paused_until)
+            self.next_slot = start + 1.0 / self.rate
+        delay = start - time.time()
+        if delay > 0:
+            time.sleep(delay)
+
+    def success(self):
+        # additive increase: every 20 good calls, add 10% of the max rate back
+        with self.lock:
+            self.successes += 1
+            if self.successes % 20 == 0 and self.rate < self.max_rate:
+                self.rate = min(self.max_rate, self.rate + self.max_rate * 0.1)
+
+    def throttled(self, wait_seconds):
+        # multiplicative decrease, at most once per 10 s, so a burst of 429s
+        # from several threads at once counts as a single slow-down
+        with self.lock:
+            now = time.time()
+            self.throttle_count += 1
+            self.paused_until = max(self.paused_until, now + wait_seconds)
+            if now - self.last_cut > 10:
+                self.last_cut = now
+                self.rate = max(self.min_rate, self.rate * 0.6)
+                print(f"  Rate limited - all threads pausing {wait_seconds:.0f}s, "
+                      f"speed now {self.rate:.1f} req/s")
+
+
+# ------------------------------ API client ------------------------------
+class SnowClient:
+    def __init__(self, limiter):
+        self.limiter = limiter
+        self.token = None
+        self.token_lock = threading.Lock()
+        self.local = threading.local()
+        self.keep_alive = KEEP_ALIVE
+        self.keep_alive_ok = False
+        self.keep_alive_failures = 0
+        self.ka_lock = threading.Lock()
+        self.ssl_ctx = ssl.create_default_context()
+        self.requests_made = 0
         self.refresh_token()
 
     def refresh_token(self, stale=None):
-        with self.lock:
+        with self.token_lock:
             if stale is not None and self.token != stale:
                 return  # another thread already refreshed it
             body = urllib.parse.urlencode({
@@ -121,48 +201,108 @@ class SnowClient:
             req = urllib.request.Request(
                 f"{BASE_URL}/idp/api/connect/token", data=body, method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                 self.token = json.load(resp)["access_token"]
 
-    def get(self, path, params=None, retries=6):
-        url = f"{BASE_URL}/{path}"
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        for attempt in range(1, retries + 1):
-            token = self.token
-            req = urllib.request.Request(url, headers={
-                "Authorization": f"Bearer {token}", "Accept": "application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    return json.load(resp)
-            except urllib.error.HTTPError as e:
-                if e.code == 401:
-                    self.refresh_token(stale=token)
-                    continue
-                if e.code == 404:
-                    raise NotFound(url)
-                if e.code in (429, 500, 502, 503, 504):
-                    try:
-                        wait = int(e.headers.get("Retry-After", ""))
-                    except ValueError:
-                        wait = min(2 ** attempt, 60)
-                    time.sleep(wait)
-                    continue
-                detail = e.read().decode(errors="ignore")[:300]
-                raise RuntimeError(f"HTTP {e.code}: {detail}") from e
-            except urllib.error.URLError:
-                time.sleep(min(2 ** attempt, 60))
-        raise RuntimeError(f"Failed after {retries} attempts: {url}")
+    # --- transport: persistent connection per thread, urllib fallback ---
+    def _connection(self):
+        conn = getattr(self.local, "conn", None)
+        if conn is None:
+            proxy = urllib.request.getproxies().get("https")
+            if proxy and not urllib.request.proxy_bypass(HOST):
+                p = urllib.parse.urlparse(proxy if "://" in proxy else "http://" + proxy)
+                conn = http.client.HTTPSConnection(
+                    p.hostname, p.port or 8080, timeout=REQUEST_TIMEOUT, context=self.ssl_ctx)
+                conn.set_tunnel(HOST, 443)
+            else:
+                conn = http.client.HTTPSConnection(
+                    HOST, 443, timeout=REQUEST_TIMEOUT, context=self.ssl_ctx)
+            self.local.conn = conn
+        return conn
 
-    def get_all(self, path, params=None):
-        params = dict(params or {})
+    def _drop_connection(self):
+        conn = getattr(self.local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.local.conn = None
+
+    def _send(self, path_and_query, token):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        if self.keep_alive:
+            conn = self._connection()
+            conn.request("GET", "/" + path_and_query, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            self.keep_alive_ok = True
+            return resp.status, resp.headers, body
+        req = urllib.request.Request(f"{BASE_URL}/{path_and_query}", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    def _keep_alive_failed(self):
+        with self.ka_lock:
+            if self.keep_alive and not self.keep_alive_ok:
+                self.keep_alive_failures += 1
+                if self.keep_alive_failures >= 3:
+                    self.keep_alive = False
+                    print("  Persistent connections not working on this network - "
+                          "switched to standard requests.")
+
+    def get(self, path, params=None):
+        target = path + ("?" + urllib.parse.urlencode(params) if params else "")
+        for attempt in range(1, MAX_RETRIES + 1):
+            self.limiter.acquire()
+            token = self.token
+            try:
+                status, headers, body = self._send(target, token)
+            except NETWORK_ERRORS:
+                self._drop_connection()
+                self._keep_alive_failed()
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            self.requests_made += 1
+            if status == 200:
+                self.limiter.success()
+                return json.loads(body)
+            if status == 401:
+                self.refresh_token(stale=token)
+                continue
+            if status == 404:
+                raise NotFound(target)
+            if status == 429:
+                try:
+                    wait = float(headers.get("Retry-After") or "")
+                except (TypeError, ValueError):
+                    wait = min(5 * attempt, 60)
+                self.limiter.throttled(wait)
+                continue
+            if status >= 500:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            raise RuntimeError(f"HTTP {status} on {target}: {body[:300]!r}")
+        raise RuntimeError(f"Gave up after {MAX_RETRIES} attempts: {target}")
+
+    def get_page(self, path, page):
+        data = self.get(path, {"page_size": PAGE_SIZE, "page_number": page})
+        items = data.get("items") or []
+        pag = data.get("pagination") or {}
+        total_pages = pag.get("total_pages")
+        if total_pages is None and pag.get("total_items") is not None:
+            total_pages = -(-int(pag["total_items"]) // PAGE_SIZE)
+        return items, total_pages
+
+    def get_all(self, path):
+        """Simple sequential pagination (used only for the application list)."""
         items, page = [], 1
         while True:
-            params.update(page_size=PAGE_SIZE, page_number=page)
-            data = self.get(path, params)
-            batch = data.get("items") or []
+            batch, total_pages = self.get_page(path, page)
             items.extend(batch)
-            total_pages = (data.get("pagination") or {}).get("total_pages")
             if total_pages is not None:
                 if page >= total_pages:
                     break
@@ -217,8 +357,12 @@ def main():
     if not CLIENT_ID or not CLIENT_SECRET or "PASTE_" in CLIENT_ID or "PASTE_" in CLIENT_SECRET:
         sys.exit(f"Fill in CLIENT_ID and CLIENT_SECRET in {ENV_PATH}")
 
-    client = SnowClient()
+    started = time.time()
+    limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
+    client = SnowClient(limiter)
     print(f"Authenticated against {BASE_URL}  (config: {ENV_PATH})")
+    print(f"  {MAX_WORKERS} threads | max {MAX_REQUESTS_PER_SECOND:g} requests/s | "
+          f"{PAGE_SIZE} users per page")
     for label, inc, exc in [
         ("Vendor", VENDOR_INCLUDE, VENDOR_EXCLUDE),
         ("Publisher", PUBLISHER_INCLUDE, PUBLISHER_EXCLUDE),
@@ -239,22 +383,121 @@ def main():
     if not matched:
         sys.exit("No applications match the vendor / publisher / application filters.")
 
-    # 2. Users per application (parallel across apps)
-    rows, failed, per_app = [], [], {}
+    apps_by_id = {a["id"]: a for a in matched}
+    users_by_app = {a["id"]: {} for a in matched}   # app id -> {page: [users]}
+    pages_expected = {}                              # app id -> total pages (None = unknown)
+    failed_pages = []                                # (app id, page)
+    data_lock = threading.Lock()
+    stats = {"pages_done": 0, "pages_total": len(matched), "phase": "first pages"}
+    done = threading.Event()
 
-    def fetch(app):
-        return app, client.get_all(f"{CV}/applications/{app['id']}/users")
+    def heartbeat():
+        while not done.wait(15):
+            with data_lock:
+                users = sum(len(u) for p in users_by_app.values() for u in p.values())
+                print(f"  [{time.time() - started:>5.0f}s] {stats['phase']}: "
+                      f"{stats['pages_done']}/{stats['pages_total']} pages | "
+                      f"{users} users fetched | {limiter.rate:.1f} req/s | "
+                      f"{limiter.throttle_count} rate-limit pauses")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = [pool.submit(fetch, a) for a in matched]
-        for n, fut in enumerate(as_completed(futs), 1):
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    def fetch(app_id, page):
+        items, total_pages = client.get_page(f"{CV}/applications/{app_id}/users", page)
+        with data_lock:
+            users_by_app[app_id][page] = items
+            stats["pages_done"] += 1
+        return app_id, page, items, total_pages
+
+    def run_jobs(jobs, on_result=None):
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futs = {pool.submit(fetch, a, p): (a, p) for a, p in jobs}
+            for fut in as_completed(futs):
+                try:
+                    result = fut.result()
+                    if on_result:
+                        on_result(result)
+                except NotFound:
+                    with data_lock:
+                        stats["pages_done"] += 1   # app has no user list; nothing to retry
+                except Exception:
+                    failed_pages.append(futs[fut])
+
+    # 2. Page 1 of every app (also tells us how many pages each one has)
+    def record_total(result):
+        app_id, page, items, total_pages = result
+        if total_pages is None and len(items) >= PAGE_SIZE:
+            total_pages = None      # unknown, more may exist - walk sequentially later
+        elif total_pages is None:
+            total_pages = 1
+        pages_expected[app_id] = total_pages
+
+    run_jobs([(a["id"], 1) for a in matched], record_total)
+
+    # 3. Every remaining page of every app, all in one shared queue
+    remaining = [(app_id, p) for app_id, tp in pages_expected.items() if tp
+                 for p in range(2, tp + 1)]
+    unknown = [app_id for app_id, tp in pages_expected.items() if tp is None]
+    big = sorted(((tp, apps_by_id[a].get("name")) for a, tp in pages_expected.items() if tp),
+                 reverse=True)[:5]
+    with data_lock:
+        stats["phase"] = "remaining pages"
+        stats["pages_total"] += len(remaining)
+    print(f"First pages done. {len(remaining)} more pages to fetch"
+          + (f" (largest apps: {', '.join(f'{n} = {tp} pages' for tp, n in big if tp > 1)})"
+             if any(tp > 1 for tp, _ in big) else ""))
+    run_jobs(remaining)
+
+    # Apps whose page count the API didn't report: walk page by page
+    for app_id in unknown:
+        page = 2
+        while True:
             try:
-                app, users = fut.result()
-            except (NotFound, RuntimeError) as e:
-                failed.append(str(e))
+                _, _, items, _ = fetch(app_id, page)
+            except Exception:
+                failed_pages.append((app_id, page))
+                break
+            if len(items) < PAGE_SIZE:
+                break
+            page += 1
+
+    # 4. Retry failed pages one at a time
+    still_failed = []
+    if failed_pages:
+        print(f"Retrying {len(failed_pages)} failed page(s) one at a time ...")
+        queue = list(failed_pages)
+        while queue:
+            app_id, page = queue.pop(0)
+            time.sleep(2)
+            try:
+                _, _, items, total_pages = fetch(app_id, page)
+            except NotFound:
                 continue
-            kept = 0
-            for u in users:
+            except Exception as e:
+                still_failed.append((apps_by_id[app_id].get("name"), page, str(e)[:150]))
+                continue
+            if page == 1:   # first page failed earlier, so its other pages were never queued
+                pages_expected[app_id] = total_pages
+                if total_pages is None and len(items) >= PAGE_SIZE:
+                    queue.append((app_id, 2))   # unknown count: walk forward
+                for p in range(2, (total_pages or 1) + 1):
+                    queue.append((app_id, p))
+            elif app_id in unknown or pages_expected.get(app_id) is None:
+                if len(items) >= PAGE_SIZE:
+                    queue.append((app_id, page + 1))
+    done.set()
+
+    # 5. Build rows
+    rows, per_app, seen = [], {}, set()
+    for app_id, pages in users_by_app.items():
+        app = apps_by_id[app_id]
+        kept = 0
+        for page in sorted(pages):
+            for u in pages[page]:
+                key = (u.get("id"), app_id)
+                if key in seen:
+                    continue
+                seen.add(key)
                 dtypes = u.get("discoveryTypes") or []
                 if not discovery_passes(dtypes):
                     continue
@@ -267,13 +510,11 @@ def main():
                     app.get("name"), app.get("vendor"), publisher_of(app),
                     app.get("categoryName"), app.get("sanctioned"),
                     app.get("discoverySource"),
-                    u.get("id"), app.get("id"),
+                    u.get("id"), app_id,
                 ])
-            per_app[app.get("name")] = kept
-            if n % 10 == 0 or n == len(matched):
-                print(f"  {n}/{len(matched)} applications done | rows so far: {len(rows)}")
+        per_app[app.get("name")] = per_app.get(app.get("name"), 0) + kept
 
-    # 3. Write CSV (fixed name, overwritten each run)
+    # 6. Write CSV (fixed name, overwritten each run)
     header = ["Name", "Email", "Username", "Country", "Department", "User status",
               "Last active", "Total days used", "User discovery types",
               "Application", "Vendor", "Publisher", "Category", "Sanctioned",
@@ -284,16 +525,19 @@ def main():
         w.writerow(header)
         w.writerows(rows)
 
-    print("\nRows per application:")
-    for name, cnt in sorted(per_app.items(), key=lambda x: -x[1]):
+    print("\nRows per application (top 30):")
+    for name, cnt in sorted(per_app.items(), key=lambda x: -x[1])[:30]:
         print(f"  {cnt:>8}  {name}")
-    print(f"\nDone - {len(rows)} rows | {len({r[15] for r in rows})} unique users "
-          f"| {sum(1 for c in per_app.values() if c)} applications with users")
+    mins = (time.time() - started) / 60
+    print(f"\nDone in {mins:.1f} min - {len(rows)} rows | {len({r[15] for r in rows})} "
+          f"unique users | {sum(1 for c in per_app.values() if c)} applications with users")
+    print(f"  API calls: {client.requests_made} | rate-limit pauses: {limiter.throttle_count}")
     print(f"Output: {OUTPUT_FILE}")
-    if failed:
-        print(f"Applications that could not be read: {len(failed)} (first 3)")
-        for m in failed[:3]:
-            print(f"  {m[:200]}")
+    if still_failed:
+        print(f"\nWARNING - {len(still_failed)} page(s) could not be read, "
+              f"so these apps are incomplete:")
+        for name, page, err in still_failed:
+            print(f"  {name} (page {page}): {err}")
 
 
 if __name__ == "__main__":
