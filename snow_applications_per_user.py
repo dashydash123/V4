@@ -20,7 +20,14 @@ How it works (built for speed without tripping the tenant rate limit)
      per call). If that fails on your network it falls back automatically.
   6. Pages that still fail are retried one at a time at the end; the
      final summary names any app whose data is incomplete.
+  7. Each page is written to disk the moment it arrives (nothing is held
+     in memory), so millions of rows are fine. While running, rows go to
+     <OUTPUT_FILE>.partial; at the end it is renamed to OUTPUT_FILE.
+  8. RESUME: if a run is interrupted (crash, closed window, lost network),
+     just run the script again with the same settings - it keeps what was
+     saved and fetches only the missing pages.
   A progress line is printed every 15 seconds, so you can see it working.
+  Rows are in download order, not sorted (sort in Power BI / Excel).
 
 Run:
     python snow_applications_per_user.py
@@ -31,7 +38,9 @@ on every run. Standard library only - no pip installs needed.
 """
 
 import csv
+import hashlib
 import http.client
+import io
 import json
 import os
 import ssl
@@ -54,7 +63,7 @@ def load_env_file(path):
         sys.exit(f"Config file not found: {path}")
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
-            line = line.replace("\u00a0", " ").strip()  # survive copy-paste spaces
+            line = line.replace(chr(0xA0), " ").strip()  # survive copy-paste spaces
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
@@ -106,8 +115,11 @@ DISCOVERY_TYPE_EXCLUDE = set(int_list("DISCOVERY_TYPE_EXCLUDE"))
 OUTPUT_FILE = cfg("OUTPUT_FILE", "ApplicationsPerUser.csv") or "ApplicationsPerUser.csv"
 if not os.path.isabs(OUTPUT_FILE):
     OUTPUT_FILE = os.path.join(SCRIPT_DIR, OUTPUT_FILE)
+PARTIAL_FILE = OUTPUT_FILE + ".partial"     # rows are streamed here during the run
+PROGRESS_FILE = OUTPUT_FILE + ".progress"   # which pages are saved (for resume)
+RESUME = cfg("RESUME", "true").lower() not in ("false", "0", "no")
 
-MAX_WORKERS = num("MAX_WORKERS", 8, int)
+MAX_WORKERS = num("MAX_WORKERS", 16, int)
 MAX_REQUESTS_PER_SECOND = num("MAX_REQUESTS_PER_SECOND", 6.0)
 REQUEST_TIMEOUT = num("REQUEST_TIMEOUT", 60.0)
 KEEP_ALIVE = cfg("KEEP_ALIVE", "true").lower() not in ("false", "0", "no")
@@ -352,12 +364,153 @@ def type_names(types):
     return "; ".join(str(DISCOVERY_TYPE_NAMES.get(t, t)) for t in sorted(types or []))
 
 
+# --------------------------- streaming output ---------------------------
+HEADER = ["Name", "Email", "Username", "Country", "Department", "User status",
+          "Last active", "Total days used", "User discovery types",
+          "Application", "Vendor", "Publisher", "Category", "Sanctioned",
+          "App discovery source", "User ID", "Application ID"]
+USER_ID_COL = 15
+
+
+def run_signature():
+    """Fingerprint of everything that changes the output; a resume is only
+    allowed when the previous unfinished run had the same settings."""
+    settings = [REGION, PAGE_SIZE, HEADER,
+                VENDOR_INCLUDE, VENDOR_EXCLUDE, PUBLISHER_INCLUDE, PUBLISHER_EXCLUDE,
+                APPLICATION_INCLUDE, APPLICATION_EXCLUDE,
+                sorted(DISCOVERY_TYPE_INCLUDE), sorted(DISCOVERY_TYPE_EXCLUDE)]
+    return hashlib.sha1(json.dumps(settings).encode()).hexdigest()[:16]
+
+
+class OutputWriter:
+    """Writes each page's rows to disk the moment it arrives, so memory use
+    stays flat no matter how many millions of rows there are.
+
+    Every saved page is logged in a .progress file together with the CSV
+    size after it was written. If the run crashes, the next run truncates
+    the CSV back to the last fully logged page and only fetches the pages
+    that are missing."""
+
+    def __init__(self, signature):
+        self.lock = threading.Lock()
+        self.done = {}            # (app_id, page) -> (total_pages, items_on_page)
+        self.kept_by_app = {}     # app_id -> rows written
+        self.user_ids = set()
+        self.rows_written = 0
+        self.resumed = False
+        lines = None
+        if RESUME and os.path.exists(PARTIAL_FILE) and os.path.exists(PROGRESS_FILE):
+            lines = self._load_progress(signature)
+        if lines is not None:
+            self.resumed = True
+            self._rebuild_user_ids()
+            self.f = open(PARTIAL_FILE, "ab")
+            self.p = open(PROGRESS_FILE, "w", encoding="utf-8")   # rewrite cleanly
+            self.p.write(f"#sig\t{signature}\n" + "".join(lines))
+            self.p.flush()
+        else:
+            self.done.clear()
+            self.kept_by_app.clear()
+            self.rows_written = 0
+            self.f = open(PARTIAL_FILE, "wb")
+            self.f.write(b"\xef\xbb\xbf" + self._encode([HEADER]))   # BOM for Excel
+            self.f.flush()
+            self.p = open(PROGRESS_FILE, "w", encoding="utf-8")
+            self.p.write(f"#sig\t{signature}\n")
+            self.p.flush()
+
+    @staticmethod
+    def _encode(rows):
+        buf = io.StringIO()
+        csv.writer(buf).writerows(rows)
+        return buf.getvalue().encode("utf-8")
+
+    def _load_progress(self, signature):
+        good_lines, last_offset = [], None
+        with open(PROGRESS_FILE, encoding="utf-8") as p:
+            if p.readline().rstrip("\n").split("\t") != ["#sig", signature]:
+                print("An unfinished previous run used different settings - starting fresh.")
+                return None
+            for line in p:
+                if not line.endswith("\n"):
+                    break                       # half-written last line from the crash
+                parts = line.rstrip("\n").split("\t")
+                try:
+                    app_id, page, tp, off, n_items, kept = parts
+                    page, off, n_items, kept = int(page), int(off), int(n_items), int(kept)
+                    tp = int(tp) if tp else None
+                except ValueError:
+                    break
+                self.done[(app_id, page)] = (tp, n_items)
+                self.kept_by_app[app_id] = self.kept_by_app.get(app_id, 0) + kept
+                self.rows_written += kept
+                last_offset = off
+                good_lines.append(line)
+        if last_offset is None or os.path.getsize(PARTIAL_FILE) < last_offset:
+            if last_offset is not None:
+                print("Saved progress does not match the partial file - starting fresh.")
+            return None
+        with open(PARTIAL_FILE, "r+b") as f:
+            f.truncate(last_offset)             # drop any half-written page
+        return good_lines
+
+    def _rebuild_user_ids(self):
+        with open(PARTIAL_FILE, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) > USER_ID_COL:
+                    self.user_ids.add(row[USER_ID_COL])
+
+    def write_page(self, app_id, page, total_pages, n_items, rows):
+        data = self._encode(rows) if rows else b""
+        with self.lock:
+            if (app_id, page) in self.done:
+                return
+            if data:
+                self.f.write(data)
+                self.f.flush()
+            offset = self.f.tell()
+            tp = "" if total_pages is None else total_pages
+            self.p.write(f"{app_id}\t{page}\t{tp}\t{offset}\t{n_items}\t{len(rows)}\n")
+            self.p.flush()
+            self.done[(app_id, page)] = (total_pages, n_items)
+            self.kept_by_app[app_id] = self.kept_by_app.get(app_id, 0) + len(rows)
+            self.rows_written += len(rows)
+            self.user_ids.update(r[USER_ID_COL] for r in rows)
+
+    def finalize(self):
+        self.f.close()
+        self.p.close()
+        try:
+            os.replace(PARTIAL_FILE, OUTPUT_FILE)
+        except PermissionError:
+            print(f"\nCould not replace {OUTPUT_FILE} - it is probably open in Excel.")
+            print("Close it and run the script again: nothing is re-downloaded, it just "
+                  "finishes saving.")
+            return False
+        os.remove(PROGRESS_FILE)
+        return True
+
+
+def page_count(total_pages, n_items):
+    """Pages for an app, from its first page. None = unknown, keep walking."""
+    if total_pages is not None:
+        return total_pages
+    return None if n_items >= PAGE_SIZE else 1
+
+
 # ------------------------------- main -------------------------------
 def main():
     if not CLIENT_ID or not CLIENT_SECRET or "PASTE_" in CLIENT_ID or "PASTE_" in CLIENT_SECRET:
         sys.exit(f"Fill in CLIENT_ID and CLIENT_SECRET in {ENV_PATH}")
 
     started = time.time()
+    writer = OutputWriter(run_signature())
+    if writer.resumed:
+        print(f"Resuming the previous unfinished run: {len(writer.done)} pages / "
+              f"{writer.rows_written} rows already saved - only missing pages will be fetched.")
+
     limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
     client = SnowClient(limiter)
     print(f"Authenticated against {BASE_URL}  (config: {ENV_PATH})")
@@ -384,30 +537,54 @@ def main():
         sys.exit("No applications match the vendor / publisher / application filters.")
 
     apps_by_id = {a["id"]: a for a in matched}
-    users_by_app = {a["id"]: {} for a in matched}   # app id -> {page: [users]}
-    pages_expected = {}                              # app id -> total pages (None = unknown)
-    failed_pages = []                                # (app id, page)
-    data_lock = threading.Lock()
-    stats = {"pages_done": 0, "pages_total": len(matched), "phase": "first pages"}
-    done = threading.Event()
+    pages_expected = {a: page_count(tp, n) for (a, pg), (tp, n) in writer.done.items()
+                      if pg == 1 and a in apps_by_id}
+    failed_pages = []
+    stat_lock = threading.Lock()
+    stats = {"pages_done": 0, "pages_total": 0, "phase": "first pages"}
+    finished = threading.Event()
 
     def heartbeat():
-        while not done.wait(15):
-            with data_lock:
-                users = sum(len(u) for p in users_by_app.values() for u in p.values())
+        while not finished.wait(15):
+            with stat_lock:
                 print(f"  [{time.time() - started:>5.0f}s] {stats['phase']}: "
                       f"{stats['pages_done']}/{stats['pages_total']} pages | "
-                      f"{users} users fetched | {limiter.rate:.1f} req/s | "
+                      f"{writer.rows_written} rows saved | {limiter.rate:.1f} req/s | "
                       f"{limiter.throttle_count} rate-limit pauses")
 
     threading.Thread(target=heartbeat, daemon=True).start()
 
+    def to_rows(app, items):
+        rows = []
+        for u in items:
+            dtypes = u.get("discoveryTypes") or []
+            if not discovery_passes(dtypes):
+                continue
+            rows.append([
+                u.get("displayName"), u.get("email"), u.get("username"),
+                u.get("country"), u.get("department"), u.get("status"),
+                u.get("lastActive"), u.get("totalDaysUsed"),
+                type_names(dtypes),
+                app.get("name"), app.get("vendor"), publisher_of(app),
+                app.get("categoryName"), app.get("sanctioned"),
+                app.get("discoverySource"),
+                u.get("id"), app.get("id"),
+            ])
+        return rows
+
     def fetch(app_id, page):
-        items, total_pages = client.get_page(f"{CV}/applications/{app_id}/users", page)
-        with data_lock:
-            users_by_app[app_id][page] = items
+        """Fetch one page, write it straight to disk, keep nothing in memory."""
+        if (app_id, page) in writer.done:          # saved by an earlier run
+            tp, n_items = writer.done[(app_id, page)]
+            return app_id, page, n_items, tp
+        items, tp = client.get_page(f"{CV}/applications/{app_id}/users", page)
+        n_items = len(items)
+        rows = to_rows(apps_by_id[app_id], items)
+        del items
+        writer.write_page(app_id, page, tp, n_items, rows)
+        with stat_lock:
             stats["pages_done"] += 1
-        return app_id, page, items, total_pages
+        return app_id, page, n_items, tp
 
     def run_jobs(jobs, on_result=None):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -418,31 +595,32 @@ def main():
                     if on_result:
                         on_result(result)
                 except NotFound:
-                    with data_lock:
+                    with stat_lock:
                         stats["pages_done"] += 1   # app has no user list; nothing to retry
                 except Exception:
                     failed_pages.append(futs[fut])
 
-    # 2. Page 1 of every app (also tells us how many pages each one has)
-    def record_total(result):
-        app_id, page, items, total_pages = result
-        if total_pages is None and len(items) >= PAGE_SIZE:
-            total_pages = None      # unknown, more may exist - walk sequentially later
-        elif total_pages is None:
-            total_pages = 1
-        pages_expected[app_id] = total_pages
+    # 2. Page 1 of every app not already known (tells us each app's page count)
+    first = [(a["id"], 1) for a in matched if a["id"] not in pages_expected]
+    with stat_lock:
+        stats["pages_total"] = len(first)
 
-    run_jobs([(a["id"], 1) for a in matched], record_total)
+    def record_total(result):
+        app_id, _, n_items, tp = result
+        pages_expected[app_id] = page_count(tp, n_items)
+
+    run_jobs(first, record_total)
 
     # 3. Every remaining page of every app, all in one shared queue
-    remaining = [(app_id, p) for app_id, tp in pages_expected.items() if tp
-                 for p in range(2, tp + 1)]
-    unknown = [app_id for app_id, tp in pages_expected.items() if tp is None]
+    remaining = [(a, p) for a, tp in pages_expected.items() if tp
+                 for p in range(2, tp + 1) if (a, p) not in writer.done]
+    unknown = [a for a, tp in pages_expected.items() if tp is None]
     big = sorted(((tp, apps_by_id[a].get("name")) for a, tp in pages_expected.items() if tp),
                  reverse=True)[:5]
-    with data_lock:
+    with stat_lock:
         stats["phase"] = "remaining pages"
-        stats["pages_total"] += len(remaining)
+        stats["pages_done"] = 0
+        stats["pages_total"] = len(remaining)
     print(f"First pages done. {len(remaining)} more pages to fetch"
           + (f" (largest apps: {', '.join(f'{n} = {tp} pages' for tp, n in big if tp > 1)})"
              if any(tp > 1 for tp, _ in big) else ""))
@@ -453,11 +631,11 @@ def main():
         page = 2
         while True:
             try:
-                _, _, items, _ = fetch(app_id, page)
+                _, _, n_items, _ = fetch(app_id, page)
             except Exception:
                 failed_pages.append((app_id, page))
                 break
-            if len(items) < PAGE_SIZE:
+            if n_items < PAGE_SIZE:
                 break
             page += 1
 
@@ -470,69 +648,43 @@ def main():
             app_id, page = queue.pop(0)
             time.sleep(2)
             try:
-                _, _, items, total_pages = fetch(app_id, page)
+                _, _, n_items, tp = fetch(app_id, page)
             except NotFound:
                 continue
             except Exception as e:
                 still_failed.append((apps_by_id[app_id].get("name"), page, str(e)[:150]))
                 continue
             if page == 1:   # first page failed earlier, so its other pages were never queued
-                pages_expected[app_id] = total_pages
-                if total_pages is None and len(items) >= PAGE_SIZE:
-                    queue.append((app_id, 2))   # unknown count: walk forward
-                for p in range(2, (total_pages or 1) + 1):
-                    queue.append((app_id, p))
-            elif app_id in unknown or pages_expected.get(app_id) is None:
-                if len(items) >= PAGE_SIZE:
-                    queue.append((app_id, page + 1))
-    done.set()
+                pages_expected[app_id] = page_count(tp, n_items)
+                if pages_expected[app_id] is None:
+                    queue.append((app_id, 2))
+                for p in range(2, (pages_expected[app_id] or 1) + 1):
+                    if (app_id, p) not in writer.done:
+                        queue.append((app_id, p))
+            elif pages_expected.get(app_id) is None and n_items >= PAGE_SIZE:
+                queue.append((app_id, page + 1))
+    finished.set()
 
-    # 5. Build rows
-    rows, per_app, seen = [], {}, set()
-    for app_id, pages in users_by_app.items():
-        app = apps_by_id[app_id]
-        kept = 0
-        for page in sorted(pages):
-            for u in pages[page]:
-                key = (u.get("id"), app_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                dtypes = u.get("discoveryTypes") or []
-                if not discovery_passes(dtypes):
-                    continue
-                kept += 1
-                rows.append([
-                    u.get("displayName"), u.get("email"), u.get("username"),
-                    u.get("country"), u.get("department"), u.get("status"),
-                    u.get("lastActive"), u.get("totalDaysUsed"),
-                    type_names(dtypes),
-                    app.get("name"), app.get("vendor"), publisher_of(app),
-                    app.get("categoryName"), app.get("sanctioned"),
-                    app.get("discoverySource"),
-                    u.get("id"), app_id,
-                ])
-        per_app[app.get("name")] = per_app.get(app.get("name"), 0) + kept
+    # 5. Finish: rename the partial file to the real output name
+    saved = writer.finalize()
 
-    # 6. Write CSV (fixed name, overwritten each run)
-    header = ["Name", "Email", "Username", "Country", "Department", "User status",
-              "Last active", "Total days used", "User discovery types",
-              "Application", "Vendor", "Publisher", "Category", "Sanctioned",
-              "App discovery source", "User ID", "Application ID"]
-    rows.sort(key=lambda r: ((r[0] or "").lower(), (r[9] or "").lower()))
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(rows)
-
+    per_app = {}
+    for app_id, kept in writer.kept_by_app.items():
+        name = apps_by_id.get(app_id, {}).get("name", app_id)
+        per_app[name] = per_app.get(name, 0) + kept
     print("\nRows per application (top 30):")
     for name, cnt in sorted(per_app.items(), key=lambda x: -x[1])[:30]:
-        print(f"  {cnt:>8}  {name}")
+        print(f"  {cnt:>9}  {name}")
     mins = (time.time() - started) / 60
-    print(f"\nDone in {mins:.1f} min - {len(rows)} rows | {len({r[15] for r in rows})} "
+    print(f"\nDone in {mins:.1f} min - {writer.rows_written} rows | {len(writer.user_ids)} "
           f"unique users | {sum(1 for c in per_app.values() if c)} applications with users")
-    print(f"  API calls: {client.requests_made} | rate-limit pauses: {limiter.throttle_count}")
-    print(f"Output: {OUTPUT_FILE}")
+    print(f"  API calls this run: {client.requests_made} | "
+          f"rate-limit pauses: {limiter.throttle_count}")
+    if saved:
+        print(f"Output: {OUTPUT_FILE}")
+    if writer.rows_written > 1_048_575:
+        print("  Note: that is more rows than Excel can open (1,048,576). Load the CSV "
+              "into Power BI, or narrow the filters.")
     if still_failed:
         print(f"\nWARNING - {len(still_failed)} page(s) could not be read, "
               f"so these apps are incomplete:")
