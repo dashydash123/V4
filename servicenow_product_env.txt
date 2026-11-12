@@ -1,0 +1,23 @@
+SN_INSTANCE=abinbevww
+SN_CLIENT_ID=
+SN_CLIENT_SECRET=
+SN_REFRESH_TOKEN=
+SN_ACCESS_TOKEN=
+
+# Products to pull - separate with ;  (names as in output/servicenow_available_products.csv)
+SN_PRODUCTS=Strategic Portfolio Management Professional - User
+
+# Take a product's users from group membership:  product=group1|group2 ; product2=group3
+SN_PRODUCT_GROUPS=Strategic Portfolio Management Professional - User=Brewassets - Requester (Creator/Editor)
+
+# Optional
+SN_ALL_USER_PRODUCTS=
+SN_DORMANT_DAYS=90
+SN_UHS_SUBSCRIPTION_FIELD=subscription
+SN_UHS_USER_FIELD=user
+SN_PAGE_SIZE=1000
+SN_OUTPUT_DIR=output
+
+# Diagnostics script only
+SN_DIAG_PRODUCT=Strategic Portfolio Management Professional
+SN_DIAG_GROUP=Brewassets - Requester (Creator/Editor)
