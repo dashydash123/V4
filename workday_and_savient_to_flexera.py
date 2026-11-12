@@ -147,14 +147,20 @@ FIELD_SOURCES = {
     "hireDate":     [],                     # left blank for now
     "costCenter":   ["cost_center_desc", "cost_center"],
 }
-JOIN_KEY = "global_employee_id"           # also used as the roster "id"
+JOIN_KEY = "global_employee_id"           # preferred roster "id"
+LOCAL_KEY = "local_employee_id"           # fallback id / third matching key
 HC_STATUS_COL = "employee_status"
 HC_LOAD_DATE_COL = "load_date"            # used to pick the latest duplicate
 TERM_DATE_COL = "termination_date"
 
 MAPPING_NOTES = {
-    "id": "global_employee_id (join key). Rows with no global ID are excluded.",
-    "email": "employee_email, falls back to upn when blank.",
+    "id": "global_employee_id. A row without one is linked to a global ID by "
+          "email, then by local_employee_id + country (only where that key "
+          "belongs to one global ID). A person with no global ID anywhere gets "
+          "their local_employee_id, unless it clashes - see Id_Review.",
+    "email": "employee_email, else upn, else the person's email from their "
+             "other Workday rows. People without a valid email are left out "
+             "(Flexera requires one) - see Id_Review.",
     "employmentStatus": "Still in the headcount view -> employee_status wins "
                         "(Active -> Employed, on leave -> On leave), even with a "
                         "past termination date (rehire). Otherwise in termination "
@@ -300,8 +306,32 @@ def _headcount_status(value):
     return "Not monitored"
 
 
+REVIEW_COLUMNS = ["issue", "roster id", "global_employee_id",
+                  "local_employee_id", "email", "name", "employmentStatus",
+                  "found in"]
+
+
+def _unique_lookup(both, has_g, col):
+    """Map key value -> global ID, only for keys that belong to exactly one
+    global ID. Also returns the keys shared by several global IDs."""
+    pairs = both.loc[has_g & both[col].notna(), [col, "_gid"]].drop_duplicates()
+    n = pairs.groupby(col)["_gid"].nunique()
+    single = n[n == 1].index
+    lookup = (pairs[pairs[col].isin(single)].drop_duplicates(col)
+              .set_index(col)["_gid"])
+    return lookup, set(n[n > 1].index)
+
+
 def build_hr_roster(headcount, termination, cutoff=None):
-    """Returns (roster_df, mapping_df, stats_df)."""
+    """Returns (roster_df, mapping_df, stats_df, review_df).
+
+    Matching a person across the two views: global ID first. A row without
+    one is linked by email, then by local ID + country - each only where
+    that key belongs to exactly one global ID, so a weaker key never
+    overrides a different global ID. Roster id: the global ID; a person with
+    no global ID anywhere gets their local ID unless it clashes. People
+    without a valid email are left out, because Flexera requires one.
+    """
     today = pd.Timestamp(date.today())
     hc = _lower_cols(headcount)
     tm = _lower_cols(termination)
@@ -309,31 +339,97 @@ def build_hr_roster(headcount, termination, cutoff=None):
         if JOIN_KEY not in df.columns:
             raise ValueError(f"{JOIN_KEY} missing from {name} view")
 
-    # Headcount: drop rows without an ID, keep latest duplicate by load_date
-    hc["_gid"] = _id(hc[JOIN_KEY])
-    hc_no_id = int(hc["_gid"].isna().sum())
-    hc = hc[hc["_gid"].notna()]
-    if HC_LOAD_DATE_COL in hc.columns:
-        hc = hc.assign(_ld=_to_date(hc[HC_LOAD_DATE_COL])).sort_values(
-            "_ld", ascending=False, na_position="last")
-    hc_before = len(hc)
-    hc = hc.drop_duplicates("_gid", keep="first")
-    hc_dupes = hc_before - len(hc)
-    log.info("Headcount: %s rows -> %s unique employees (%s no ID, %s duplicates)",
-             len(headcount), len(hc), hc_no_id, hc_dupes)
+    def keys(df, view):
+        df = df.copy()
+        df["_view"] = view
+        df["_gid"] = _id(df[JOIN_KEY])
+        df["_lid"] = (_id(df[LOCAL_KEY]) if LOCAL_KEY in df.columns else
+                      pd.Series(pd.NA, index=df.index, dtype="string"))
+        df["_email"], _ = _coalesce(df, FIELD_SOURCES["email"])
+        df["_ekey"] = df["_email"].str.lower()
+        country, _ = _coalesce(df, FIELD_SOURCES["country"])
+        df["_lkey"] = df["_lid"] + "|" + country.str.lower().fillna("")
+        return df
 
-    # Termination: keep the latest termination date per employee
-    tm["_gid"] = _id(tm[JOIN_KEY])
-    tm_no_id = int(tm["_gid"].isna().sum())
-    tm = tm[tm["_gid"].notna()]
-    tm["_tdate"] = _to_date(tm[TERM_DATE_COL]) if TERM_DATE_COL in tm.columns \
-        else pd.NaT
-    tm = tm.sort_values("_tdate", ascending=False, na_position="last")
-    tm_before = len(tm)
-    tm = tm.drop_duplicates("_gid", keep="first")
-    tm_dupes = tm_before - len(tm)
-    log.info("Termination: %s rows -> %s unique leavers (%s no ID, %s duplicates)",
-             len(termination), len(tm), tm_no_id, tm_dupes)
+    hc = keys(hc, "headcount")
+    tm = keys(tm, "termination")
+    hc["_ld"] = (_to_date(hc[HC_LOAD_DATE_COL]) if HC_LOAD_DATE_COL in hc.columns
+                 else pd.NaT)
+    tm["_tdate"] = (_to_date(tm[TERM_DATE_COL]) if TERM_DATE_COL in tm.columns
+                    else pd.NaT)
+    hc_no_gid = int(hc["_gid"].isna().sum())
+    tm_no_gid = int(tm["_gid"].isna().sum())
+
+    # 1. Who is who: global ID -> email -> local ID + country
+    both = pd.concat([hc, tm], ignore_index=True)
+    has_g = both["_gid"].notna()
+    by_email, shared_emails = _unique_lookup(both, has_g, "_ekey")
+    by_local, _ = _unique_lookup(both, has_g, "_lkey")
+    gid = both["_gid"].copy()
+    how = pd.Series("none", index=both.index, dtype="string")
+    how[has_g] = "global"
+    via_email = gid.isna() & both["_ekey"].map(by_email).notna()
+    gid[via_email] = both.loc[via_email, "_ekey"].map(by_email)
+    how[via_email] = "email"
+    via_local = gid.isna() & both["_lkey"].map(by_local).notna()
+    gid[via_local] = both.loc[via_local, "_lkey"].map(by_local)
+    how[via_local] = "local"
+    pid = "G:" + gid
+    rest_e = gid.isna() & both["_ekey"].notna()
+    pid[rest_e] = "E:" + both.loc[rest_e, "_ekey"]
+    rest_l = gid.isna() & both["_ekey"].isna() & both["_lkey"].notna()
+    pid[rest_l] = "L:" + both.loc[rest_l, "_lkey"]
+    both["_gfinal"], both["_how"], both["_pid"] = gid, how, pid
+
+    review = []
+
+    def add_review(mask, issue, df, ids=None, status=None, found=None):
+        if not mask.any():
+            return
+        if isinstance(issue, pd.Series):
+            issue = issue[mask]
+        sub = df[mask]
+        if "name" in sub:
+            nm = sub["name"]
+        else:
+            nm, _ = _coalesce(sub, FIELD_SOURCES["name"])
+        review.append(pd.DataFrame({
+            "issue": issue,
+            "roster id": ids[mask] if ids is not None else pd.NA,
+            "global_employee_id": sub["_gfinal"],
+            "local_employee_id": sub["_lid"],
+            "email": sub["email"] if "email" in sub else sub["_email"],
+            "name": nm,
+            "employmentStatus": status[mask] if status is not None else pd.NA,
+            "found in": found[mask] if found is not None else sub["_view"],
+        }))
+
+    add_review(both["_how"] == "email", "Global ID found via email", both)
+    add_review(both["_how"] == "local",
+               "Global ID found via local ID + country", both)
+    add_review(has_g & both["_ekey"].isin(shared_emails),
+               "Same email on different global IDs - kept separate", both)
+    no_key = both["_pid"].isna()
+    n_no_key = int(no_key.sum())
+    both = both[~no_key]
+    n_via_email = int(via_email.sum())
+    n_via_local = int(via_local.sum())
+
+    # 2. One row per person in each view
+    hc = both[both["_view"] == "headcount"].sort_values(
+        "_ld", ascending=False, na_position="last")
+    tm = both[both["_view"] == "termination"].sort_values(
+        "_tdate", ascending=False, na_position="last")
+    email_by_pid = (pd.concat([hc, tm]).dropna(subset=["_email"])
+                    .drop_duplicates("_pid").set_index("_pid")["_email"])
+    hc_before, tm_before = len(hc), len(tm)
+    hc = hc.drop_duplicates("_pid", keep="first")
+    tm = tm.drop_duplicates("_pid", keep="first")
+    hc_dupes, tm_dupes = hc_before - len(hc), tm_before - len(tm)
+    log.info("Headcount: %s rows -> %s people (%s rows without a global ID, "
+             "%s duplicates)", len(headcount), len(hc), hc_no_gid, hc_dupes)
+    log.info("Termination: %s rows -> %s people (%s rows without a global ID, "
+             "%s duplicates)", len(termination), len(tm), tm_no_gid, tm_dupes)
 
     # Optional cutoff: ignore leavers who left before it
     cut_excluded = 0
@@ -346,25 +442,29 @@ def build_hr_roster(headcount, termination, cutoff=None):
 
     def project(df, source):
         out = pd.DataFrame(index=df.index)
-        out["id"] = df["_gid"]
         used = {}
         for field, cands in FIELD_SOURCES.items():
             out[field], used[field] = _coalesce(df, cands)
+        for c in ("_pid", "_gfinal", "_lid", "_email"):
+            out[c] = df[c]
         out["_hc_status"] = df[HC_STATUS_COL] if (
             source == "hc" and HC_STATUS_COL in df.columns) else pd.NA
         return out, used
 
     hc_out, hc_used = project(hc, "hc")
-    tm_only = tm[~tm["_gid"].isin(hc["_gid"])]
+    tm_only = tm[~tm["_pid"].isin(set(hc["_pid"]))]
     tm_out, tm_used = project(tm_only, "tm")
 
     roster = pd.concat([hc_out, tm_out], ignore_index=True)
-    tdates = tm.set_index("_gid")["_tdate"]
-    roster["_tdate"] = roster["id"].map(tdates)
-    in_term = roster["id"].isin(tm["_gid"])
-
+    roster["email"] = roster["email"].fillna(roster["_pid"].map(email_by_pid))
+    tdates = tm.set_index("_pid")["_tdate"]
+    roster["_tdate"] = roster["_pid"].map(tdates)
+    in_term = roster["_pid"].isin(set(tm["_pid"]))
     in_hc = pd.Series([True] * len(hc_out) + [False] * len(tm_out),
                       index=roster.index)
+    found_in = pd.Series("termination", index=roster.index, dtype="string")
+    found_in[in_hc] = "headcount"
+    found_in[in_hc & in_term] = "both views"
     grace = pd.Timedelta(days=REHIRE_GRACE_DAYS)
 
     def status(row, termed, in_headcount):
@@ -391,23 +491,54 @@ def build_hr_roster(headcount, termination, cutoff=None):
                    (roster["employmentStatus"] != "Not employed")).sum())
     log.info("Rehires kept employed (past termination, still in headcount): %s",
              rehires)
-    # A rehire's old termination date would be misleading next to an active
-    # status, so only keep dates for leavers and future-dated terminations.
     keep_tdate = (roster["employmentStatus"] == "Not employed") | (
         roster["_tdate"] > today)
     roster["terminationDate"] = roster["_tdate"].where(
         keep_tdate).dt.strftime("%Y-%m-%d")
     roster["hireDate"] = _to_date(roster["hireDate"]).dt.strftime("%Y-%m-%d")
     roster["isDeleted"] = "FALSE"
-    roster = roster[ROSTER_COLUMNS]
+
+    # 3. Roster id: global ID, else local ID (if it can't clash)
+    all_gids = set(both["_gid"].dropna())
+    roster["id"] = roster["_gfinal"]
+    fallback = roster["id"].isna()
+    roster.loc[fallback, "id"] = roster.loc[fallback, "_lid"]
+    reason = pd.Series(pd.NA, index=roster.index, dtype="string")
+    reason[~roster["email"].fillna("").str.contains("@")] = \
+        "Left out - no valid email"
+    reason[fallback & reason.isna() & roster["id"].isna()] = \
+        "Left out - no global or local ID"
+    reason[fallback & reason.isna() & roster["id"].isin(all_gids)] = \
+        "Left out - local ID is another person's global ID"
+    open_fb = fallback & reason.isna()
+    shared_lid = open_fb & roster["id"].where(open_fb).duplicated(keep=False) \
+        & roster["id"].notna()
+    reason[shared_lid] = "Left out - local ID shared by several people"
+    used_local = fallback & reason.isna()
+
+    add_review(used_local, "No global ID - local ID used as id", roster,
+               roster["id"], roster["employmentStatus"], found_in)
+    add_review(reason.notna(), reason, roster, roster["id"],
+               roster["employmentStatus"], found_in)
+
+    left_out = reason.notna()
+    no_email = reason == "Left out - no valid email"
+    no_email_active = int((no_email & roster["employmentStatus"].isin(
+        ["Employed", "On leave"])).sum())
+    roster = roster[~left_out][ROSTER_COLUMNS].reset_index(drop=True)
+    review_df = (pd.concat(review, ignore_index=True) if review
+                 else pd.DataFrame(columns=REVIEW_COLUMNS))[REVIEW_COLUMNS]
+    if shared_emails:
+        log.warning("%s emails belong to more than one global ID - kept as "
+                    "separate people, see Id_Review", len(shared_emails))
 
     mapping = []
     for field in ROSTER_COLUMNS:
-        hc_src = ", ".join(hc_used.get(field, [])) or (
-            JOIN_KEY if field == "id" else "")
-        tm_src = ", ".join(tm_used.get(field, [])) or (
-            JOIN_KEY if field == "id" else "")
-        if field == "isDeleted":
+        hc_src = ", ".join(hc_used.get(field, []))
+        tm_src = ", ".join(tm_used.get(field, []))
+        if field == "id":
+            hc_src = tm_src = f"{JOIN_KEY} > email > {LOCAL_KEY} + country"
+        elif field == "isDeleted":
             hc_src = tm_src = "(always FALSE)"
         elif field == "employmentStatus":
             hc_src, tm_src = HC_STATUS_COL, TERM_DATE_COL
@@ -433,15 +564,24 @@ def build_hr_roster(headcount, termination, cutoff=None):
         ["Future-dated leavers (still Employed)", future_dated],
         ["Headcount duplicates removed", hc_dupes],
         ["Termination duplicates removed", tm_dupes],
-        ["Headcount rows excluded (no global ID)", hc_no_id],
-        ["Termination rows excluded (no global ID)", tm_no_id],
+        ["Headcount rows without a global ID", hc_no_gid],
+        ["Termination rows without a global ID", tm_no_gid],
+        ["  - global ID found via email (rows)", n_via_email],
+        ["  - global ID found via local ID + country (rows)", n_via_local],
+        ["  - rows with no global ID, email or local ID (dropped)", n_no_key],
+        ["People with no global ID - local ID used as id", int(used_local.sum())],
+        ["People left out - no valid email", int(no_email.sum())],
+        ["  - of which Employed / On leave", no_email_active],
+        ["People left out - id problem (see Id_Review)",
+         int((left_out & ~no_email).sum())],
+        ["Emails on more than one global ID (kept separate)", len(shared_emails)],
         ["Termination cutoff date", CUTOFF_DATE or "none"],
         ["Leavers excluded by cutoff", cut_excluded],
         ["Run date", date.today().isoformat()],
     ], columns=["Check", "Value"])
     for _, r in stats_df.iterrows():
-        log.info("  %-42s %s", r["Check"], r["Value"])
-    return roster, mapping_df, stats_df
+        log.info("  %-50s %s", r["Check"], r["Value"])
+    return roster, mapping_df, stats_df, review_df
 
 
 # ---------------- Saviynt contractors ----------------
@@ -833,9 +973,9 @@ def main():
     used = {"index", "hr_roster", "hr_roster_mapping", "saviynt_added",
             "saviynt_skipped", "saviynt_contractors", "departures_sent",
             "superseded_records", "location_values", "location_cleaned",
-            "workday_missing"}
+            "workday_missing", "id_review"}
     saviynt = sav_added = sav_skipped = prev_state = None
-    zone_reports, loc_values = [], None
+    zone_reports, loc_values, id_review = [], None, None
     departures = superseded = workday_missing = None
     source = []
     frames, plan = {}, []          # plan: (sheet names, dataframe)
@@ -871,7 +1011,7 @@ def main():
     try:
         if HEADCOUNT_VIEW not in frames or TERMINATION_VIEW not in frames:
             raise ValueError("headcount or termination view not loaded")
-        roster, mapping_df, stats_df = build_hr_roster(
+        roster, mapping_df, stats_df, id_review = build_hr_roster(
             frames[HEADCOUNT_VIEW], frames[TERMINATION_VIEW], cutoff)
 
         # Clean the Workday zone before Saviynt can fill any gaps
@@ -915,6 +1055,24 @@ def main():
             dep_stats = apply_departures(roster)
         source = (["Workday"] * n_workday + ["Saviynt"] * n_sav_added
                   + ["Saviynt"] * len(departures))
+
+        # Flexera matches people on email, so flag any email used twice
+        ekey = roster["email"].astype("string").str.strip().str.lower()
+        dup_email = ekey.notna() & ekey.duplicated(keep=False)
+        if dup_email.any():
+            log.warning("%s roster rows share an email with another row - "
+                        "see Id_Review", int(dup_email.sum()))
+            d = roster[dup_email]
+            id_review = pd.concat([id_review, pd.DataFrame({
+                "issue": "Same email on more than one roster row",
+                "roster id": d["id"], "global_employee_id": pd.NA,
+                "local_employee_id": d["employeeId"], "email": d["email"],
+                "name": d["name"], "employmentStatus": d["employmentStatus"],
+                "found in": [source[i] for i in d.index]})], ignore_index=True)
+        stats_df = pd.concat([stats_df, pd.DataFrame(
+            [["Roster rows sharing an email with another row",
+              int(dup_email.sum())]], columns=["Check", "Value"])],
+            ignore_index=True)
         stats_df = pd.concat([
             stats_df,
             pd.DataFrame(dep_stats + [["Final roster rows uploaded",
@@ -968,6 +1126,8 @@ def main():
                                 index=False)
             stats_df.to_excel(writer, sheet_name="HR_Roster_Mapping",
                               index=False, startrow=len(mapping_df) + 3)
+        if id_review is not None and len(id_review):
+            id_review.to_excel(writer, sheet_name="Id_Review", index=False)
         if loc_values is not None:
             loc_values.to_excel(writer, sheet_name="Location_Values",
                                 index=False)
