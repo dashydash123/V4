@@ -1,0 +1,85 @@
+# Settings for workday_to_flexera.py and validate_workday.py.
+# Save this file as env.txt in the same folder as the scripts and fill it in.
+# (A file named .env in that folder is used instead, if one exists.)
+# No quotes needed, even for paths with spaces.
+# Keep this file out of email, shared drives and Git - it holds your secrets.
+
+# --- Databricks authentication: use ONE of the two ---
+DATABRICKS_TOKEN=paste-your-personal-access-token-here
+# DATABRICKS_CLIENT_ID=
+# DATABRICKS_CLIENT_SECRET=
+
+# --- Source (defaults already match the ABI workspace) ---
+DATABRICKS_HOST=adb-3060038306817150.10.azuredatabricks.net
+DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/13861ac29ff00f3e
+DATABRICKS_CATALOG=brewdat_uc_people_prod
+DATABRICKS_SCHEMA=gld_ghq_people_workday_tr
+
+# --- Optional cutoff ---
+# Leave blank for every leaver. Set yyyy-mm-dd to drop leavers who left
+# before that date from the HR roster (raw sheets always keep everything).
+TERMINATION_CUTOFF_DATE=
+
+# --- Rehire rule ---
+# Someone still in the headcount view counts as employed even if the
+# termination view holds a past date for them (a rehire).
+# Set a number of days to treat very recent terminations as leavers anyway,
+# which guards against headcount snapshot lag. 0 = headcount always wins.
+REHIRE_GRACE_DAYS=0
+
+# --- Output ---
+# Files keep the same names and are overwritten on every run:
+#   workday_hr_data.xlsx, hr_roster.csv, validation.xlsx
+# Each script appends to its own log in this folder:
+#   workday_to_flexera.log, get_workday_leavers.log, validate_workday.log
+OUTPUT_DIR=output
+# LOG_FILE=output/workday_to_flexera.log
+
+# --- Saviynt contractors (used by workday_to_flexera.py only) ---
+# Contractors whose email is not already in the HR roster are added to it.
+# Use ONE of:
+#   a) a OneDrive-synced copy of the SharePoint file (recommended), e.g.
+#      the ELP_Automation copy - already filled in below
+#   b) the SharePoint link, or the path to the "Saviynt" .url shortcut, which
+#      is downloaded via Microsoft Graph and needs the three GRAPH_* settings.
+# Leave blank to skip Saviynt.
+SAVIYNT_SOURCE=C:\Users\srv_global_flexera\OneDrive - Anheuser-Busch InBev\ELP_Automation\Saviynt_Contractors_Data.xlsx
+# Sheet to read; blank = first sheet
+SAVIYNT_SHEET=AnalyticsHistory
+# Saviynt column used as the roster id. username is unique per contractor;
+# text values (e.g. ADAM.WOODILL) are fine - Flexera's id is just text.
+# Contractors whose username is already a Workday id are skipped and listed
+# on the Saviynt_Skipped sheet, so they can't overwrite an employee.
+SAVIYNT_ID_COLUMN=username
+# Only needed for option b): Entra app with Files.Read.All or Sites.Read.All
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
+
+# --- Departures (used by workday_to_flexera.py only) ---
+# Flexera keeps a user's last status when they are missing from an upload.
+# This file records what was last uploaded successfully; anyone active in it
+# who is missing today is sent once as "Not employed". It is only updated
+# after a successful upload. Don't delete it.
+# First time: copy the last roster you uploaded to Flexera (e.g.
+# hr_roster_20261106.csv) to this name so earlier contractors are covered.
+ROSTER_STATE_FILE=output/flexera_roster_state.csv
+# Safety stop: if more people than this vanish in one run, nothing is
+# uploaded (usually a source came back incomplete). Raise it for one run if
+# the departures are real.
+MAX_DEPARTURES_PER_RUN=500
+
+# --- Flexera upload (used by workday_to_flexera.py only) ---
+# yes = upload the HR roster CSV after building it; no = build files only
+FLEXERA_UPLOAD=yes
+# From the Application Registration with 'Manage SaaS data import API
+# integrations' permission. Copy the token URL from your working ADO script.
+FLEXERA_TOKEN_URL=
+FLEXERA_CLIENT_ID=
+FLEXERA_CLIENT_SECRET=
+# HR roster import configuration ID (top of the API Integration panel)
+FLEXERA_CONFIG_ID=a38d1b8f-3627-4ff7-a270-d557616e05fd
+# Full URLs from steps 1 and 3 of the API Integration panel
+# (scroll right in each box to copy the whole line after POST)
+FLEXERA_UPLOAD_URL_ENDPOINT=
+FLEXERA_SUBMIT_ENDPOINT=
