@@ -18,7 +18,7 @@ Setup (requests is already installed with the Databricks connector):
     pip install databricks-sql-connector databricks-sdk pandas pyarrow openpyxl xlsxwriter
     (xlsxwriter is optional but uses much less memory for the Excel file)
 
-All settings live in a .env file next to this script (see .env.example).
+All settings live in a .env or env.txt file next to this script.
 Nothing secret is written to the log.
 """
 import os
@@ -36,7 +36,12 @@ from databricks.sdk.core import Config, oauth_service_principal
 # ---------------- .env loading ----------------
 def load_env(path=None):
     """Read KEY=VALUE lines from .env. Real environment variables win."""
-    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not path:
+        # Settings file next to the script: .env, or env.txt if there's no .env
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, ".env")
+        if not os.path.exists(path) and os.path.exists(os.path.join(here, "env.txt")):
+            path = os.path.join(here, "env.txt")
     if not os.path.exists(path):
         return path, False
     with open(path, encoding="utf-8-sig") as fh:
@@ -165,7 +170,9 @@ MAPPING_NOTES = {
     "terminationDate": "termination_date (latest per employee), yyyy-mm-dd; "
                        "future dates are kept; cleared for rehires.",
     "costCenter": "cost_center_desc - this is a description, not a code.",
-    "isDeleted": "TRUE when employmentStatus is Not employed, else FALSE.",
+    "isDeleted": "Always FALSE. Flexera's docs don't describe this field and "
+                 "it isn't mapped in the import; leavers are identified by "
+                 "employmentStatus = Not employed.",
 }
 
 log = logging.getLogger("workday")
@@ -391,8 +398,7 @@ def build_hr_roster(headcount, termination, cutoff=None):
     roster["terminationDate"] = roster["_tdate"].where(
         keep_tdate).dt.strftime("%Y-%m-%d")
     roster["hireDate"] = _to_date(roster["hireDate"]).dt.strftime("%Y-%m-%d")
-    roster["isDeleted"] = (roster["employmentStatus"] == "Not employed").map(
-        {True: "TRUE", False: "FALSE"})
+    roster["isDeleted"] = "FALSE"
     roster = roster[ROSTER_COLUMNS]
 
     mapping = []
@@ -401,7 +407,9 @@ def build_hr_roster(headcount, termination, cutoff=None):
             JOIN_KEY if field == "id" else "")
         tm_src = ", ".join(tm_used.get(field, [])) or (
             JOIN_KEY if field == "id" else "")
-        if field in ("employmentStatus", "isDeleted"):
+        if field == "isDeleted":
+            hc_src = tm_src = "(always FALSE)"
+        elif field == "employmentStatus":
             hc_src, tm_src = HC_STATUS_COL, TERM_DATE_COL
         if field == "terminationDate":
             hc_src, tm_src = "", TERM_DATE_COL
@@ -551,7 +559,7 @@ def merge_saviynt(roster, saviynt):
     Mapping: email -> email, SAVIYNT_ID_COLUMN (username) -> id,
     fullname -> name, zone -> location, employeetype -> employeeType,
     enddate -> terminationDate. Status: Employed while the end date is today
-    or later (or blank); Not employed + isDeleted TRUE once it has passed.
+    or later (or blank); Not employed once it has passed. isDeleted FALSE.
     Rows are skipped (and listed) when they have no valid email, no id, or an
     id another roster row already uses, since that would overwrite them.
     Zone: Workday has priority. A Workday row whose zone is blank (or was
@@ -630,7 +638,7 @@ def merge_saviynt(roster, saviynt):
     added["location"] = sv["_zone"]
     added["employeeType"] = _text(sv["employeetype"])
     added["terminationDate"] = sv["_end"].dt.strftime("%Y-%m-%d")
-    added.loc[ended, "isDeleted"] = "TRUE"
+    added["isDeleted"] = "FALSE"
     added = added[ROSTER_COLUMNS].reset_index(drop=True)
 
     skipped_df = (pd.concat(skipped, ignore_index=True)
@@ -666,24 +674,39 @@ def merge_saviynt(roster, saviynt):
             stats, zone_report, filled)
 
 
-def apply_departures(roster):
-    """Send people who were active in the last successful upload but are
-    missing today as Not employed, so Flexera doesn't keep them Employed.
+def _infer_source(prev):
+    """Which source each id in the state file came from.
 
-    Someone missing under their old id whose email now belongs to another
-    active record (e.g. a contractor who became an employee, or an id that
-    changed) is left alone - they are not leaving. They are picked up as soon
-    as that other record stops being active.
-    Returns (roster, previous_state, departures, superseded, stats rows).
+    Newer state files have a 'source' column. For older ones (or a roster CSV
+    copied in to seed the state), a row is a Saviynt contractor if it has an
+    employeeType - this script only fills employeeType from Saviynt.
+    """
+    inferred = prev["employeeType"].notna().map({True: "Saviynt",
+                                                 False: "Workday"})
+    return prev["source"].fillna(inferred) if "source" in prev.columns \
+        else inferred
+
+
+def apply_departures(roster):
+    """Send Saviynt contractors who were active in the last successful upload
+    but are missing today as Not employed, so Flexera doesn't keep them
+    Employed. Workday people are left out: Workday leavers come through the
+    termination view, so anyone missing from Workday is only listed.
+
+    A contractor missing under their old id whose email now belongs to
+    another active record (e.g. hired as an employee) is left alone - they
+    are not leaving. They are picked up once that record stops being active.
+    Returns (roster, previous_state, departures, superseded, workday_missing,
+    stats rows).
     """
     today = pd.Timestamp(date.today())
     no_rows = pd.DataFrame(columns=ROSTER_COLUMNS)
     if not os.path.exists(ROSTER_STATE_FILE):
-        log.warning("Departures: no upload state file yet (%s) - people who "
-                    "dropped out of the sources can't be detected on this run. "
+        log.warning("Departures: no upload state file yet (%s) - contractors "
+                    "who dropped out of Saviynt can't be detected on this run. "
                     "It is created after this run's upload succeeds.",
                     ROSTER_STATE_FILE)
-        return roster, None, no_rows, no_rows, [
+        return roster, None, no_rows, no_rows, no_rows, [
             ["Previous upload state", "none - first run, departures not checked"]]
 
     prev = pd.read_csv(ROSTER_STATE_FILE, dtype=str, encoding="utf-8-sig",
@@ -697,14 +720,20 @@ def apply_departures(roster):
     for col in ROSTER_COLUMNS + ["lastSent"]:
         if col not in prev.columns:
             prev[col] = pd.NA
+    prev["source"] = _infer_source(prev)
     prev["id"] = _id(prev["id"])
     prev = prev[prev["id"].notna()].drop_duplicates("id", keep="last")
 
     gone = prev[~prev["id"].isin(set(roster["id"].dropna()))]
     was_active = gone["employmentStatus"].fillna("").str.strip().str.lower() \
         != "not employed"
-    gone_active = gone[was_active]
+    from_saviynt = gone["source"] == "Saviynt"
 
+    # Workday: never marked as leavers here, only listed for review
+    workday_missing = gone[~from_saviynt & was_active][ROSTER_COLUMNS]
+
+    # Saviynt: real departures, unless the email moved to an active record
+    gone_active = gone[from_saviynt & was_active]
     active_now = roster["employmentStatus"].isin(["Employed", "On leave"])
     active_emails = set(roster.loc[active_now, "email"].dropna().astype(str)
                         .str.strip().str.lower())
@@ -715,45 +744,55 @@ def apply_departures(roster):
 
     if len(departed) > MAX_DEPARTURES:
         raise RuntimeError(
-            f"{len(departed)} people who were active in the last upload are "
-            f"missing today - more than MAX_DEPARTURES_PER_RUN={MAX_DEPARTURES}. "
-            "This usually means a source came back incomplete, so nothing was "
-            "uploaded. Check the Workday views and the Saviynt file; if the "
-            "departures are real, raise MAX_DEPARTURES_PER_RUN in .env for "
-            "one run.")
+            f"{len(departed)} Saviynt contractors who were active in the last "
+            f"upload are missing today - more than MAX_DEPARTURES_PER_RUN="
+            f"{MAX_DEPARTURES}. This usually means the Saviynt file came back "
+            "incomplete (or SAVIYNT_SOURCE is blank), so nothing was uploaded. "
+            "Check the file; if the departures are real, raise "
+            "MAX_DEPARTURES_PER_RUN in env.txt for one run.")
 
     tomb = departed[ROSTER_COLUMNS].copy()
     td = _to_date(tomb["terminationDate"])
     tomb["terminationDate"] = td.where(td.notna() & (td <= today), today) \
         .dt.strftime("%Y-%m-%d")
     tomb["employmentStatus"] = "Not employed"
-    tomb["isDeleted"] = "TRUE"
+    tomb["isDeleted"] = "FALSE"
     tomb["location"], dep_zone = clean_zone(tomb["location"], "Last upload")
     if len(dep_zone):
         log.info("Departures: %s carried-over zone values removed in cleaning",
                  int(dep_zone["rows"].sum()))
+    if len(workday_missing):
+        log.warning("Departures: %s Workday people who were active in the last "
+                    "upload are missing from both Workday views today - left "
+                    "unchanged in Flexera, see the Workday_Missing sheet",
+                    len(workday_missing))
 
     stats = [
         ["Previous upload state", f"{len(prev)} ids "
          f"(last sent {prev['lastSent'].dropna().max() if prev['lastSent'].notna().any() else 'unknown'})"],
         ["Previously uploaded ids missing today", len(gone)],
         ["  - already Not employed in Flexera (not resent)", int((~was_active).sum())],
-        ["  - email now on another active record (left as is)", len(superseded)],
-        ["  - departed: sent as Not employed", len(tomb)],
+        ["  - Workday, active last time (left as is, see Workday_Missing)",
+         len(workday_missing)],
+        ["  - Saviynt, email now on another active record (left as is)",
+         len(superseded)],
+        ["  - Saviynt departed: sent as Not employed", len(tomb)],
     ]
     for label, value in stats:
         log.info("  %-58s %s", label, value)
     return (pd.concat([roster, tomb], ignore_index=True), prev, tomb,
-            superseded, stats)
+            superseded, workday_missing, stats)
 
 
-def save_state(prev, sent):
-    """Remember what Flexera now holds: today's upload plus older ids."""
+def save_state(prev, sent, source):
+    """Remember what Flexera now holds: today's upload plus older ids,
+    with the source (Workday / Saviynt) of each."""
     state = sent[ROSTER_COLUMNS].copy()
+    state["source"] = list(source)
     state["lastSent"] = date.today().isoformat()
     if prev is not None:
         keep = prev[~prev["id"].isin(set(state["id"].dropna()))]
-        state = pd.concat([state, keep[ROSTER_COLUMNS + ["lastSent"]]],
+        state = pd.concat([state, keep[ROSTER_COLUMNS + ["source", "lastSent"]]],
                           ignore_index=True)
     tmp = ROSTER_STATE_FILE + ".tmp"
     state.to_csv(tmp, index=False, encoding="utf-8-sig")
@@ -793,10 +832,12 @@ def main():
     index_rows, failures = [], 0
     used = {"index", "hr_roster", "hr_roster_mapping", "saviynt_added",
             "saviynt_skipped", "saviynt_contractors", "departures_sent",
-            "superseded_records", "location_values", "location_cleaned"}
+            "superseded_records", "location_values", "location_cleaned",
+            "workday_missing"}
     saviynt = sav_added = sav_skipped = prev_state = None
     zone_reports, loc_values = [], None
-    departures = superseded = None
+    departures = superseded = workday_missing = None
+    source = []
     frames, plan = {}, []          # plan: (sheet names, dataframe)
 
     # 1. Fetch every view first, then close the connection
@@ -870,8 +911,10 @@ def main():
             log.info("Saviynt: skipped (SAVIYNT_SOURCE not set)")
 
         # 2c. People who were in the last upload but are missing today
-        roster, prev_state, departures, superseded, dep_stats = \
-            apply_departures(roster)
+        roster, prev_state, departures, superseded, workday_missing, \
+            dep_stats = apply_departures(roster)
+        source = (["Workday"] * n_workday + ["Saviynt"] * n_sav_added
+                  + ["Saviynt"] * len(departures))
         stats_df = pd.concat([
             stats_df,
             pd.DataFrame(dep_stats + [["Final roster rows uploaded",
@@ -935,6 +978,9 @@ def main():
         if departures is not None and len(departures):
             departures.to_excel(writer, sheet_name="Departures_Sent",
                                 index=False)
+        if workday_missing is not None and len(workday_missing):
+            workday_missing.to_excel(writer, sheet_name="Workday_Missing",
+                                     index=False)
         if superseded is not None and len(superseded):
             superseded.to_excel(writer, sheet_name="Superseded_Records",
                                 index=False)
@@ -953,7 +999,7 @@ def main():
     log.info("Saved %s objects to %s", len(objects), out)
     if failures:
         raise RuntimeError(f"{failures} object(s) failed - see Index sheet")
-    return csv_out, roster, prev_state
+    return csv_out, roster, prev_state, source
 
 
 # ---------------- Flexera upload ----------------
@@ -1047,10 +1093,10 @@ def upload_to_flexera(csv_path, row_count):
 if __name__ == "__main__":
     setup_logging()
     try:
-        csv_path, roster, prev_state = main()
+        csv_path, roster, prev_state, source = main()
         if FLEXERA_UPLOAD:
             upload_to_flexera(csv_path, len(roster))
-            save_state(prev_state, roster)
+            save_state(prev_state, roster, source)
         else:
             log.info("Flexera upload skipped (FLEXERA_UPLOAD=no) - upload "
                      "state left unchanged")
