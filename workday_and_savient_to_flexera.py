@@ -83,8 +83,32 @@ CUTOFF_DATE = env("TERMINATION_CUTOFF_DATE")
 # or newer still counts as a leaver. 0 = headcount always wins.
 REHIRE_GRACE_DAYS = int(env("REHIRE_GRACE_DAYS", "0") or 0)
 
-OUTPUT_DIR = env("OUTPUT_DIR", "output")
-LOG_FILE = env("LOG_FILE", os.path.join(OUTPUT_DIR, "workday_to_flexera.log"))
+# Relative paths in the settings are taken from the script's own folder, not
+# from wherever the script was started (VS Code, Task Scheduler, a shell...).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _abs(path):
+    return path if not path or os.path.isabs(path) else os.path.join(BASE_DIR, path)
+
+
+OUTPUT_DIR = _abs(env("OUTPUT_DIR", "output"))
+
+
+def _file_setting(key, default_name):
+    """A file from the settings: a plain name goes in OUTPUT_DIR, a path with
+    a folder in it starts from the script's folder, a full path is used as is."""
+    value = env(key, default_name).strip('"') or default_name
+    if os.path.isabs(value):
+        return value
+    if os.path.dirname(value):
+        return os.path.join(BASE_DIR, value)
+    return os.path.join(OUTPUT_DIR, value)
+
+
+OUTPUT_EXCEL_FILE = _file_setting("OUTPUT_EXCEL_FILE", "workday_hr_data.xlsx")
+OUTPUT_CSV_FILE = _file_setting("OUTPUT_CSV_FILE", "hr_roster.csv")
+LOG_FILE = _file_setting("LOG_FILE", "workday_to_flexera.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # ---------------- Flexera settings ----------------
@@ -106,7 +130,9 @@ HTTP_TIMEOUT = 120
 #   - a SharePoint https link, or the path to the "Saviynt" .url shortcut,
 #     which is downloaded through Microsoft Graph (needs the GRAPH_* settings).
 # Blank = skip Saviynt.
-SAVIYNT_SOURCE = env("SAVIYNT_SOURCE")
+SAVIYNT_SOURCE = env("SAVIYNT_SOURCE").strip('"')
+if SAVIYNT_SOURCE and not SAVIYNT_SOURCE.lower().startswith("http"):
+    SAVIYNT_SOURCE = _abs(SAVIYNT_SOURCE)
 SAVIYNT_SHEET = env("SAVIYNT_SHEET")              # blank = first sheet
 SAVIYNT_ID_COLUMN = env("SAVIYNT_ID_COLUMN", "username").lower()
 GRAPH_TENANT_ID = env("GRAPH_TENANT_ID")
@@ -117,8 +143,10 @@ GRAPH_CLIENT_SECRET = env("GRAPH_CLIENT_SECRET")
 # Flexera keeps a user's last status when they are missing from an upload,
 # so this file remembers what was last uploaded successfully. Anyone in it
 # who is active there but missing today is sent once as "Not employed".
-ROSTER_STATE_FILE = env("ROSTER_STATE_FILE",
-                        os.path.join(OUTPUT_DIR, "flexera_roster_state.csv"))
+ROSTER_STATE_FILE = _file_setting("ROSTER_STATE_FILE",
+                                  "flexera_roster_state.csv")
+SAVIYNT_DOWNLOAD_FILE = _file_setting("SAVIYNT_DOWNLOAD_FILE",
+                                      "saviynt_contractors.xlsx")
 # Safety stop: more departures than this in one run usually means a source
 # came back incomplete, so the run stops before uploading.
 MAX_DEPARTURES = int(env("MAX_DEPARTURES_PER_RUN", "500") or 500)
@@ -204,6 +232,9 @@ def setup_logging():
     log.info("Settings file: %s", ENV_PATH if ENV_FOUND else f"{ENV_PATH} (not found - using defaults)")
     log.info("Warehouse: %s%s", HOST, HTTP_PATH)
     log.info("Schema: %s.%s", CATALOG, SCHEMA)
+    log.info("Output folder: %s", OUTPUT_DIR)
+    log.info("Files: Excel %s | CSV %s | log %s", OUTPUT_EXCEL_FILE,
+             OUTPUT_CSV_FILE, LOG_FILE)
     log.info("Termination cutoff: %s", CUTOFF_DATE or "none (all leavers)")
     log.info("Flexera upload: %s", "ON" if FLEXERA_UPLOAD else "OFF (files only)")
     log.info("Saviynt source: %s", _mask_source(SAVIYNT_SOURCE) or "none (skipped)")
@@ -640,15 +671,23 @@ def load_saviynt():
         log.info("Saviynt: reading link from shortcut %s", src)
         src = _url_from_shortcut(src)
     if src.lower().startswith("http"):
-        dest = os.path.join(OUTPUT_DIR, "saviynt_contractors.xlsx")
+        dest = SAVIYNT_DOWNLOAD_FILE
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         ensure_writable(dest)
         src = _download_from_sharepoint(src, dest)
     if not os.path.exists(src):
         raise FileNotFoundError(f"Saviynt file not found: {src}")
-    if src.lower().endswith(".csv"):
-        df = pd.read_csv(src, dtype=str, encoding="utf-8-sig")
-    else:
-        df = pd.read_excel(src, sheet_name=SAVIYNT_SHEET or 0, dtype=str)
+    try:
+        if src.lower().endswith(".csv"):
+            df = pd.read_csv(src, dtype=str, encoding="utf-8-sig")
+        else:
+            df = pd.read_excel(src, sheet_name=SAVIYNT_SHEET or 0, dtype=str)
+    except OSError as e:
+        raise RuntimeError(
+            f"Couldn't read the Saviynt file {src} ({e}). If it is in OneDrive, "
+            "the file is probably online-only: start OneDrive, then right-click "
+            "the file and choose 'Always keep on this device'. Also close it if "
+            "it is open in Excel.") from e
     df = _lower_cols(df)
     log.info("Saviynt: %s rows read from %s", len(df), os.path.basename(src))
     return df
@@ -934,6 +973,7 @@ def save_state(prev, sent, source):
         keep = prev[~prev["id"].isin(set(state["id"].dropna()))]
         state = pd.concat([state, keep[ROSTER_COLUMNS + ["source", "lastSent"]]],
                           ignore_index=True)
+    os.makedirs(os.path.dirname(ROSTER_STATE_FILE), exist_ok=True)
     tmp = ROSTER_STATE_FILE + ".tmp"
     state.to_csv(tmp, index=False, encoding="utf-8-sig")
     os.replace(tmp, ROSTER_STATE_FILE)
@@ -963,9 +1003,13 @@ def excel_engine():
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out = os.path.join(OUTPUT_DIR, "workday_hr_data.xlsx")
-    csv_out = os.path.join(OUTPUT_DIR, "hr_roster.csv")
+    out, csv_out = OUTPUT_EXCEL_FILE, OUTPUT_CSV_FILE
+    if not out.lower().endswith(".xlsx"):
+        raise ValueError(f"OUTPUT_EXCEL_FILE must end in .xlsx: {out}")
+    if not csv_out.lower().endswith(".csv"):
+        raise ValueError(f"OUTPUT_CSV_FILE must end in .csv: {csv_out}")
+    for path in (OUTPUT_DIR, os.path.dirname(out), os.path.dirname(csv_out)):
+        os.makedirs(path, exist_ok=True)
     ensure_writable(out, csv_out, ROSTER_STATE_FILE)
     cutoff = pd.Timestamp(CUTOFF_DATE) if CUTOFF_DATE else None
 
