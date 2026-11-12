@@ -8,7 +8,7 @@ SN_ACCESS_TOKEN=
 SN_PRODUCTS=Strategic Portfolio Management Professional - User
 
 # Take a product's users from group membership:  product=group1|group2 ; product2=group3
-SN_PRODUCT_GROUPS=Strategic Portfolio Management Professional - User=Brewassets - Requester (Creator/Editor)
+SN_PRODUCT_GROUPS=
 
 # Optional
 SN_ALL_USER_PRODUCTS=
