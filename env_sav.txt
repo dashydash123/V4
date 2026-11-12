@@ -37,8 +37,9 @@ OUTPUT_EXCEL_FILE=workday_hr_data.xlsx
 OUTPUT_CSV_FILE=hr_roster.csv
 # The log is added to on every run (rolls over to .log.1 at 5 MB).
 LOG_FILE=workday_to_flexera.log
-# validate_workday.py writes validation.xlsx and validate_workday.log in
-# OUTPUT_DIR.
+# validate_workday.py files (same rules)
+VALIDATION_EXCEL_FILE=validation.xlsx
+VALIDATION_LOG_FILE=validate_workday.log
 
 # --- Saviynt contractors (used by workday_to_flexera.py only) ---
 # Contractors whose email is not already in the HR roster are added to it.
