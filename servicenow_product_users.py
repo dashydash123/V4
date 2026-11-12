@@ -8,6 +8,8 @@ the script downloads, for just those products:
   output/servicenow_product_licenses.csv    licence details per product: every field ServiceNow
                                             holds (type, dates, purchased, ...) + user counts
   output/servicenow_product_users.csv       every user on each product, full detail
+  output/servicenow_assignment_subscriptions.csv  subscriptions that have user assignments in
+                                            ServiceNow (user_has_subscription), with row counts
   output/flexera_user_assignments.csv       Flexera-ready user assignments (one row per user per product)
   output/flexera_user_activities.csv        Flexera-ready user activities (last login)
   output/flexera_excluded_users.csv         users left out of the Flexera files, with the reason
@@ -27,7 +29,7 @@ SN_PRODUCTS=App Engine Enterprise;Customer Service Management Standard
                                      # first, then "name contains" if nothing matches exactly.
 
 # Optional
-SN_PRODUCT_GROUPS=Strategic Portfolio Management Professional - User=Brewassets - Requester (Creator/Editor)
+SN_PRODUCT_GROUPS=                   # e.g. Strategic Portfolio Management Professional - User=Brewassets - Requester (Creator/Editor)
                                      # take a product's users from ServiceNow group membership
                                      # instead of user_has_subscription. Format:
                                      # product=group1|group2 ; product2=group3
@@ -47,7 +49,7 @@ import csv
 import os
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -308,6 +310,20 @@ def match_products(subs: list[dict]) -> list[dict]:
     return list(chosen.values())
 
 
+def norm(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def uhs_links(product: str, uhs_names: list[str]) -> list[str]:
+    """user_has_subscription subscription names that belong to a license_details product.
+    e.g. 'Strategic Portfolio Management Professional - User' <- 'Strategic Portfolio Management Professional'."""
+    p = norm(product)
+    exact = [k for k in uhs_names if k == p]
+    if exact:
+        return exact
+    return [k for k in uhs_names if k and (p.startswith(k + " - ") or k.startswith(p + " - "))]
+
+
 def product_groups(chosen: list[dict]) -> dict[str, list[str]]:
     """SN_PRODUCT_GROUPS -> {subscription sys_id: [group names]}."""
     out: dict[str, list[str]] = {}
@@ -396,19 +412,36 @@ def main() -> None:
 
     if assigned_subs:
         print("Fetching user assignments (user_has_subscription) ...")
-        sample = fetch(client, "user_has_subscription", limit=1, quiet=True)
-        if sample is None:
+        uhs = fetch(client, "user_has_subscription")
+        if uhs is None:
             print("  user_has_subscription not readable - per-user products will have no users")
-        elif sample and (UHS_SUB_FIELD not in sample[0] or UHS_USER_FIELD not in sample[0]):
-            fields = sorted(k for k in sample[0] if not k.endswith("_display"))
+        elif uhs and (UHS_SUB_FIELD not in uhs[0] or UHS_USER_FIELD not in uhs[0]):
+            fields = sorted(k for k in uhs[0] if not k.endswith("_display"))
             sys.exit(f"user_has_subscription has no '{UHS_SUB_FIELD}'/'{UHS_USER_FIELD}' field. "
                      f"Its fields are: {', '.join(fields)}\n"
                      f"Set SN_UHS_SUBSCRIPTION_FIELD / SN_UHS_USER_FIELD in .env to the right ones.")
-        elif sample:
-            wanted = {s["sys_id"] for s in assigned_subs}
-            rows = fetch_by_ids(client, "user_has_subscription", UHS_SUB_FIELD, sorted(wanted))
-            pairs += [(r[UHS_SUB_FIELD], r[UHS_USER_FIELD], "Assigned in ServiceNow")
-                      for r in rows if r.get(UHS_SUB_FIELD) in wanted and r.get(UHS_USER_FIELD)]
+        elif uhs:
+            # user_has_subscription points at a different subscription record than
+            # license_details, so link the two by subscription name.
+            by_name: dict[str, list[dict]] = defaultdict(list)
+            for r in uhs:
+                by_name[norm(r.get(f"{UHS_SUB_FIELD}_display", ""))].append(r)
+            write_csv("servicenow_assignment_subscriptions", sorted(
+                [{"subscription_in_user_has_subscription": rows[0].get(f"{UHS_SUB_FIELD}_display", ""),
+                  "rows": len(rows),
+                  "active_rows": sum(r.get("active", "true").lower() != "false" for r in rows)}
+                 for rows in by_name.values()], key=lambda r: -r["rows"]))
+            for s in assigned_subs:
+                links = uhs_links(sub_name(s), list(by_name))
+                rows = [r for k in links for r in by_name[k]]
+                rows += [r for r in uhs if r.get(UHS_SUB_FIELD) == s["sys_id"] and r not in rows]
+                active_rows = [r for r in rows if r.get("active", "true").lower() != "false"]
+                shown = ", ".join(f"'{by_name[k][0].get(f'{UHS_SUB_FIELD}_display', '')}'" for k in links)
+                print(f"  {sub_name(s)} <- {shown or 'no matching subscription'}: "
+                      f"{len(active_rows)} active assignments"
+                      + (f" ({len(rows) - len(active_rows)} inactive skipped)" if len(rows) != len(active_rows) else ""))
+                pairs += [(s["sys_id"], r[UHS_USER_FIELD], "Assigned in ServiceNow")
+                          for r in active_rows if r.get(UHS_USER_FIELD)]
 
     # 3. Users ----------------------------------------------------------------
     print("Fetching users ...")
