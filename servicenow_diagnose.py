@@ -14,8 +14,16 @@ Everything printed is also written to output/servicenow_diagnostics.txt (overwri
 """
 
 import os
+import sys
+from pathlib import Path
 
-import servicenow_product_users as base
+# Portable/embeddable Python doesn't search the script's own folder - add it
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import servicenow_product_users as base
+except ModuleNotFoundError:
+    sys.exit(f"servicenow_product_users.py must be in the same folder as this script "
+             f"({Path(__file__).resolve().parent})")
 
 PRODUCT = (os.environ.get("SN_DIAG_PRODUCT", "").strip()
            or (base.PRODUCTS[0] if base.PRODUCTS else "Strategic Portfolio Management Professional"))
