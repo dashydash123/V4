@@ -58,15 +58,17 @@ GRAPH_CLIENT_SECRET=
 
 # --- Departures (used by workday_to_flexera.py only) ---
 # Flexera keeps a user's last status when they are missing from an upload.
-# This file records what was last uploaded successfully; anyone active in it
-# who is missing today is sent once as "Not employed". It is only updated
-# after a successful upload. Don't delete it.
+# This file records what was last uploaded successfully. Saviynt contractors
+# who were active in it but are missing today are sent once as "Not employed".
+# Workday people are left out (Workday leavers come from the termination
+# view); any who vanish are only listed on the Workday_Missing sheet.
+# It is only updated after a successful upload. Don't delete it.
 # First time: copy the last roster you uploaded to Flexera (e.g.
 # hr_roster_20261106.csv) to this name so earlier contractors are covered.
 ROSTER_STATE_FILE=output/flexera_roster_state.csv
-# Safety stop: if more people than this vanish in one run, nothing is
-# uploaded (usually a source came back incomplete). Raise it for one run if
-# the departures are real.
+# Safety stop: if more Saviynt contractors than this vanish in one run,
+# nothing is uploaded (usually the Saviynt file came back incomplete or
+# SAVIYNT_SOURCE is blank). Raise it for one run if the departures are real.
 MAX_DEPARTURES_PER_RUN=500
 
 # --- Flexera upload (used by workday_to_flexera.py only) ---
