@@ -28,12 +28,17 @@ TERMINATION_CUTOFF_DATE=
 REHIRE_GRACE_DAYS=0
 
 # --- Output ---
-# Files keep the same names and are overwritten on every run:
-#   workday_hr_data.xlsx, hr_roster.csv, validation.xlsx
-# Each script appends to its own log in this folder:
-#   workday_to_flexera.log, get_workday_leavers.log, validate_workday.log
+# Folder for the files below. A relative folder starts from the scripts' folder;
+# a full path (e.g. C:\Flexera Output) is used as is.
 OUTPUT_DIR=output
-# LOG_FILE=output/workday_to_flexera.log
+# File names. A plain name goes in OUTPUT_DIR; a full path is used as is.
+# Each file keeps its name and is overwritten every run.
+OUTPUT_EXCEL_FILE=workday_hr_data.xlsx
+OUTPUT_CSV_FILE=hr_roster.csv
+# The log is added to on every run (rolls over to .log.1 at 5 MB).
+LOG_FILE=workday_to_flexera.log
+# validate_workday.py writes validation.xlsx and validate_workday.log in
+# OUTPUT_DIR.
 
 # --- Saviynt contractors (used by workday_to_flexera.py only) ---
 # Contractors whose email is not already in the HR roster are added to it.
@@ -51,7 +56,9 @@ SAVIYNT_SHEET=AnalyticsHistory
 # Contractors whose username is already a Workday id are skipped and listed
 # on the Saviynt_Skipped sheet, so they can't overwrite an employee.
 SAVIYNT_ID_COLUMN=username
-# Only needed for option b): Entra app with Files.Read.All or Sites.Read.All
+# Option b) only: where the downloaded copy is saved (overwritten each run)
+SAVIYNT_DOWNLOAD_FILE=saviynt_contractors.xlsx
+# Option b) only: Entra app with Files.Read.All or Sites.Read.All
 GRAPH_TENANT_ID=
 GRAPH_CLIENT_ID=
 GRAPH_CLIENT_SECRET=
@@ -65,7 +72,7 @@ GRAPH_CLIENT_SECRET=
 # It is only updated after a successful upload. Don't delete it.
 # First time: copy the last roster you uploaded to Flexera (e.g.
 # hr_roster_20261106.csv) to this name so earlier contractors are covered.
-ROSTER_STATE_FILE=output/flexera_roster_state.csv
+ROSTER_STATE_FILE=flexera_roster_state.csv
 # Safety stop: if more Saviynt contractors than this vanish in one run,
 # nothing is uploaded (usually the Saviynt file came back incomplete or
 # SAVIYNT_SOURCE is blank). Raise it for one run if the departures are real.
