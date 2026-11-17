@@ -121,6 +121,10 @@ FLEXERA_CONFIG_ID = env("FLEXERA_CONFIG_ID")
 # {config_id}, which is replaced with FLEXERA_CONFIG_ID.
 FLEXERA_UPLOAD_URL_ENDPOINT = env("FLEXERA_UPLOAD_URL_ENDPOINT")
 FLEXERA_SUBMIT_ENDPOINT = env("FLEXERA_SUBMIT_ENDPOINT")
+# Which roster columns go into the CSV sent to Flexera (comma-separated).
+# Blank = all of them. id, email, employmentStatus and name are always sent.
+FLEXERA_COLUMNS_SETTING = env("FLEXERA_COLUMNS")
+MANDATORY_FLEXERA_COLUMNS = ["id", "email", "employmentStatus", "name"]
 HTTP_TIMEOUT = 120
 
 # ---------------- Saviynt contractors ----------------
@@ -980,6 +984,49 @@ def save_state(prev, sent, source):
     log.info("Upload state saved: %s ids -> %s", len(state), ROSTER_STATE_FILE)
 
 
+def flexera_columns():
+    """The roster columns to send, in roster order. Mandatory ones are
+    always included; an unknown name stops the run."""
+    if not FLEXERA_COLUMNS_SETTING:
+        return list(ROSTER_COLUMNS)
+    by_lower = {c.lower(): c for c in ROSTER_COLUMNS}
+    wanted = [w.strip() for w in FLEXERA_COLUMNS_SETTING.split(",") if w.strip()]
+    unknown = [w for w in wanted if w.lower() not in by_lower]
+    if unknown:
+        raise ValueError(f"FLEXERA_COLUMNS has unknown column(s) {unknown}. "
+                         f"Choose from: {', '.join(ROSTER_COLUMNS)}")
+    chosen = {by_lower[w.lower()] for w in wanted}
+    missing = [c for c in MANDATORY_FLEXERA_COLUMNS if c not in chosen]
+    if missing:
+        log.warning("FLEXERA_COLUMNS leaves out %s - Flexera requires them, so "
+                    "they are sent anyway", ", ".join(missing))
+        chosen.update(missing)
+    return [c for c in ROSTER_COLUMNS if c in chosen]
+
+
+def check_flexera_settings():
+    """Catch upload settings that can't work before spending a full run."""
+    problems = []
+    for key, value in (("FLEXERA_TOKEN_URL", FLEXERA_TOKEN_URL),
+                       ("FLEXERA_CLIENT_ID", FLEXERA_CLIENT_ID),
+                       ("FLEXERA_CLIENT_SECRET", FLEXERA_CLIENT_SECRET),
+                       ("FLEXERA_CONFIG_ID", FLEXERA_CONFIG_ID),
+                       ("FLEXERA_UPLOAD_URL_ENDPOINT", FLEXERA_UPLOAD_URL_ENDPOINT),
+                       ("FLEXERA_SUBMIT_ENDPOINT", FLEXERA_SUBMIT_ENDPOINT)):
+        if not value:
+            problems.append(f"{key} is blank")
+    for key, url in (("FLEXERA_UPLOAD_URL_ENDPOINT", FLEXERA_UPLOAD_URL_ENDPOINT),
+                     ("FLEXERA_SUBMIT_ENDPOINT", FLEXERA_SUBMIT_ENDPOINT)):
+        m = re.search(r"/configs/([0-9A-Fa-f-]{36})", url or "")
+        if m and FLEXERA_CONFIG_ID and m.group(1).lower() != FLEXERA_CONFIG_ID.lower():
+            problems.append(
+                f"{key} points at import configuration {m.group(1)}, but "
+                f"FLEXERA_CONFIG_ID is {FLEXERA_CONFIG_ID}. Replace the ID in "
+                "the URL with {config_id} so both use the same configuration")
+    if problems:
+        raise ValueError("Flexera upload settings: " + "; ".join(problems))
+
+
 def ensure_writable(*paths):
     """Fail fast (before pulling data) if an output file is open in Excel."""
     for p in paths:
@@ -1003,6 +1050,10 @@ def excel_engine():
 
 
 def main():
+    send_cols = flexera_columns()
+    if FLEXERA_UPLOAD:
+        check_flexera_settings()
+    log.info("Columns sent to Flexera: %s", ", ".join(send_cols))
     out, csv_out = OUTPUT_EXCEL_FILE, OUTPUT_CSV_FILE
     if not out.lower().endswith(".xlsx"):
         raise ValueError(f"OUTPUT_EXCEL_FILE must end in .xlsx: {out}")
@@ -1020,6 +1071,7 @@ def main():
             "workday_missing", "id_review"}
     saviynt = sav_added = sav_skipped = prev_state = None
     zone_reports, loc_values, id_review = [], None, None
+    roster_sheet = None
     departures = superseded = workday_missing = None
     source = []
     frames, plan = {}, []          # plan: (sheet names, dataframe)
@@ -1099,6 +1151,10 @@ def main():
             dep_stats = apply_departures(roster)
         source = (["Workday"] * n_workday + ["Saviynt"] * n_sav_added
                   + ["Saviynt"] * len(departures))
+        # For checking in Excel only - never sent to Flexera
+        roster_sheet = roster.assign(source=["Workday"] * n_workday
+                                     + ["Saviynt"] * n_sav_added
+                                     + ["Saviynt (departed)"] * len(departures))
 
         # Flexera matches people on email, so flag any email used twice
         ekey = roster["email"].astype("string").str.strip().str.lower()
@@ -1142,7 +1198,18 @@ def main():
                       .value_counts().reset_index(name="rows")
                       .sort_values(["location", "taken from"]))
 
-        roster.to_csv(csv_out, index=False, encoding="utf-8-sig")
+        mapping_df.insert(4, "Sent to Flexera", mapping_df["Roster field"].map(
+            lambda f: "Yes" if f in send_cols else "No"))
+        mapping_df = pd.concat([mapping_df, pd.DataFrame([[
+            "source", "Workday", "Saviynt", "Yes", "No",
+            "Workday / Saviynt / Saviynt (departed). Excel only, for "
+            "checking - never sent to Flexera."]],
+            columns=mapping_df.columns)], ignore_index=True)
+        stats_df = pd.concat([stats_df, pd.DataFrame(
+            [["Columns sent to Flexera", ", ".join(send_cols)]],
+            columns=["Check", "Value"])], ignore_index=True)
+
+        roster[send_cols].to_csv(csv_out, index=False, encoding="utf-8-sig")
         index_rows.insert(0, ["HR_Roster, HR_Roster_Mapping",
                               f"Built from {HEADCOUNT_VIEW} + {TERMINATION_VIEW}",
                               "DERIVED", len(roster),
@@ -1165,7 +1232,8 @@ def main():
                                           "Rows", "Status"]
                      ).to_excel(writer, sheet_name="Index", index=False)
         if roster is not None:
-            roster.to_excel(writer, sheet_name="HR_Roster", index=False)
+            (roster_sheet if roster_sheet is not None else roster).to_excel(
+                writer, sheet_name="HR_Roster", index=False)
             mapping_df.to_excel(writer, sheet_name="HR_Roster_Mapping",
                                 index=False)
             stats_df.to_excel(writer, sheet_name="HR_Roster_Mapping",
@@ -1261,6 +1329,7 @@ def upload_to_flexera(csv_path, row_count):
         raise RuntimeError("HR roster is empty - refusing to upload")
     if not FLEXERA_CONFIG_ID:
         raise ValueError("FLEXERA_CONFIG_ID is not set in .env")
+    check_flexera_settings()
     upload_ep = _endpoint(FLEXERA_UPLOAD_URL_ENDPOINT, "FLEXERA_UPLOAD_URL_ENDPOINT")
     submit_ep = _endpoint(FLEXERA_SUBMIT_ENDPOINT, "FLEXERA_SUBMIT_ENDPOINT")
 
