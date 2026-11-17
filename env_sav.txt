@@ -87,9 +87,25 @@ FLEXERA_UPLOAD=yes
 FLEXERA_TOKEN_URL=
 FLEXERA_CLIENT_ID=
 FLEXERA_CLIENT_SECRET=
-# HR roster import configuration ID (top of the API Integration panel)
-FLEXERA_CONFIG_ID=a38d1b8f-3627-4ff7-a270-d557616e05fd
-# Full URLs from steps 1 and 3 of the API Integration panel
-# (scroll right in each box to copy the whole line after POST)
+# HR roster import configuration ID (top of the API Integration panel).
+# UAT and production have different IDs - use the one for the tenant you
+# are uploading to.
+FLEXERA_CONFIG_ID=
+# Full URLs from steps 1 and 3 of the API Integration panel (scroll right in
+# each box to copy the whole line after POST). Replace the configuration ID
+# inside each URL with {config_id}, so both always follow FLEXERA_CONFIG_ID:
+#   .../api/saas/import/v1/configs/{config_id}/...
 FLEXERA_UPLOAD_URL_ENDPOINT=
 FLEXERA_SUBMIT_ENDPOINT=
+
+# Columns sent to Flexera, comma-separated. Blank = all of them.
+# id, email, employmentStatus and name are always sent (Flexera requires them).
+# The import configuration in Flexera must map the same columns:
+#   id = Unique user identifier       country = Country of the user
+#   email = Email address of the user location = Location of the user
+#   employmentStatus = Employment status   department = Department of the user
+#   name = Full name of the user      employeeId = Employee ID of the user
+#   employeeType = Employee type      hireDate = Hire date of the user
+#   terminationDate = Termination date     costCenter = Cost center of the user
+#   isDeleted = Deletion status
+FLEXERA_COLUMNS=id,email,employmentStatus,name,country,location,department,employeeId,employeeType,terminationDate,costCenter
