@@ -62,7 +62,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v9 (2026-11-19: sys_created_on + created-after-last-calc check)"
+SCRIPT_VERSION = "v10 (2026-11-19: as-of ServiceNow calculation time file)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -745,6 +745,133 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
 
 
 # --------------------------------------------------------------------------- #
+# As-of view: the population as it was when ServiceNow last calculated
+# --------------------------------------------------------------------------- #
+def fetch_active_changes(sn, since):
+    """sys_audit changes to sys_user.active after `since` (UTC datetime).
+    Returns (reactivated_ids, deactivated_ids) or (None, None) if unreadable."""
+    # query one day wider (timezone-safe), then filter precisely on UTC values
+    start = (since - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = sn.try_table("sys_audit",
+                        f"tablename=sys_user^fieldname=active^sys_created_on>={start}"
+                        "^ORDERBYsys_created_on",
+                        fields=["documentkey", "oldvalue", "newvalue", "sys_created_on"],
+                        label="active-flag changes (sys_audit)")
+    if rows is None:
+        diag("[WARN] sys_audit not readable - reactivations/deactivations after the "
+             "ServiceNow calculation can't be adjusted for")
+        return None, None
+    last_change = {}
+    for r in rows:
+        when = parse_dt(r.get("sys_created_on"))
+        if when and when > since:
+            last_change[val(r.get("documentkey"))] = val(r.get("newvalue")).lower()
+    react = {u for u, v in last_change.items() if v in ("true", "1")}
+    deact = {u for u, v in last_change.items() if v in ("false", "0")}
+    diag(f"sys_audit: {len(rows):,} active-flag changes read; after calculation: "
+         f"{len(react):,} reactivated, {len(deact):,} deactivated")
+    return react, deact
+
+
+def asof_status(u, calc_on, cfg, react):
+    """Return (counts_at_calc, status) for one user, judged at calc time."""
+    created = parse_dt(u.get("sys_created_on"))
+    if created and created > calc_on:
+        return False, "created_after_calc"
+    if react is not None and u["sys_id"] in react:
+        return False, "reactivated_after_calc"
+    if not val(u.get("user_name")).strip():
+        return False, "empty_user_id"
+    if is_true(u.get("web_service_access_only")):
+        return False, "web_service_access_only"
+    if is_true(u.get("internal_integration_user")):
+        return False, "internal_integration_user"
+    last = parse_dt(u.get("last_login_time"))
+    if last is None:
+        return False, "never_logged_in"
+    if last > calc_on:
+        return True, "logged_in_after_calc (assumed counted)"
+    if last < calc_on - timedelta(days=cfg.active_login_days):
+        return False, f"no_login_{cfg.active_login_days}d_before_calc"
+    return True, "counted"
+
+
+def write_asof_file(cfg, sub, population, cache, audit, held, role_names):
+    calc_on = parse_dt(sub.get("last_allocation_cal_on"))
+    if not calc_on:
+        diag(f"[WARN] {val(sub.get('name'))}: no last_allocation_cal_on - as-of file skipped")
+        return None
+    react, deact = audit
+    base, name = sub["_slug"], val(sub.get("name"))
+    allocated = val(sub.get("allocated"))
+    target = int(allocated) if allocated.isdigit() else None
+
+    candidates = list(population)
+    if deact:
+        active_ids = {u["sys_id"] for u in population}
+        candidates += [u for u in cache.get(sorted(deact - active_ids))]
+
+    counts = defaultdict(int)
+    rows = []
+    for u in candidates:
+        ok, status = asof_status(u, calc_on, cfg, react)
+        if deact and u["sys_id"] in deact and not is_true(u.get("active")):
+            status = "deactivated_after_calc (counted at calc)" if ok else status
+        counts[status] += 1
+        if not ok:
+            continue
+        roles = held.get(u["sys_id"], {})
+        custom = sorted(role_names.get(r, r) for r in roles
+                        if is_custom_role(role_names.get(r, r)))
+        rows.append([name, u["sys_id"], val(u.get("user_name")), val(u.get("name")),
+                     val(u.get("email")), val(u.get("sys_class_name")),
+                     val(u.get("active")), val(u.get("sys_created_on")),
+                     val(u.get("last_login_time")), status,
+                     "Y" if custom else "N", ";".join(custom)])
+    write_csv(cfg.path(f"{base}_asof_servicenow_calc.csv"), [
+        "product", "user_sys_id", "user_name", "name", "email", "user_class", "active_now",
+        "sys_created_on", "last_login_time", "asof_status", "has_custom_role",
+        "all_custom_roles"], rows)
+
+    n = len(rows)
+    after = counts["logged_in_after_calc (assumed counted)"]
+    lines = [
+        ("ServiceNow calculation time (UTC, from API)", val(sub.get("last_allocation_cal_on"))),
+        ("As-of count (rows in _asof_servicenow_calc.csv)", n),
+        ("ServiceNow allocated", allocated),
+        ("Difference", (n - target) if target is not None else ""),
+        ("", ""),
+        ("of which: counted, last login before calc", counts["counted"]),
+        ("of which: logged in after calc (assumed counted)", after),
+        ("of which: deactivated after calc, added back",
+         counts["deactivated_after_calc (counted at calc)"]),
+        ("excluded: created after calc", counts["created_after_calc"]),
+        ("excluded: reactivated after calc", counts["reactivated_after_calc"]),
+        ("excluded: empty User ID", counts["empty_user_id"]),
+        ("excluded: Web service access only", counts["web_service_access_only"]),
+        ("excluded: internal integration user", counts["internal_integration_user"]),
+        ("excluded: never logged in", counts["never_logged_in"]),
+        (f"excluded: no login in {cfg.active_login_days} days before calc",
+         counts[f"no_login_{cfg.active_login_days}d_before_calc"]),
+        ("", ""),
+        ("note", "Users who logged in after calc are kept: their earlier login is "
+                 "overwritten, so a first-ever login after calc can't be told apart. "
+                 "That group is the only remaining uncertainty."),
+    ]
+    if react is None:
+        lines.append(("note", "sys_audit not readable: reactivations/deactivations after "
+                              "calc were NOT adjusted"))
+    write_csv(cfg.path(f"{base}_asof_reconciliation.csv"), ["item", "value"], lines)
+    print(f"    As of ServiceNow calc {val(sub.get('last_allocation_cal_on'))} UTC: "
+          f"{n:,} users" + (f"  vs {target:,}: {n - target:+,}" if target is not None else "") +
+          f"  (created after {counts['created_after_calc']:,}, reactivated after "
+          f"{counts['reactivated_after_calc']:,}, deactivated after added back "
+          f"{counts['deactivated_after_calc (counted at calc)']:,}, logged in after "
+          f"{after:,})")
+    return n
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="ServiceNow per-product user extract")
     ap.add_argument("--env", default=os.path.join(SCRIPT_DIR, ".env"),
@@ -781,6 +908,7 @@ def main():
     print("\n[4/6] Users per product")
     cache = UserCache(sn)
     summary = []
+    audit_cache = {"since": None, "data": (None, None)}
     for sub in subs:
         sid, name = sub["sys_id"], val(sub.get("name"))
         method, extra = methods[sid], {}
@@ -806,20 +934,31 @@ def main():
                      f"to the table your other script uses.")
                 population = cache.get(ids)
         print(f"\n[5/6] Writing files for {name}")
-        summary.append(write_product_files(cfg, sub, method, population, extra, held,
-                                           role_names, by_sub.get(sid, {}), now))
+        row = write_product_files(cfg, sub, method, population, extra, held,
+                                  role_names, by_sub.get(sid, {}), now)
+        asof_n = ""
+        if method == "all_active" and parse_dt(sub.get("last_allocation_cal_on")):
+            calc_on = parse_dt(sub.get("last_allocation_cal_on"))
+            if audit_cache.get("since") is None or calc_on < audit_cache["since"]:
+                audit_cache["since"] = calc_on
+                audit_cache["data"] = fetch_active_changes(sn, calc_on)
+            asof_n = write_asof_file(cfg, sub, population, cache, audit_cache["data"],
+                                     held, role_names)
+        row.insert(4, asof_n if asof_n is not None else "")
+        summary.append(row)
 
     print("\n[6/6] Summary")
     write_csv(cfg.path("servicenow_summary.csv"), [
         "product", "method", "users_found", "counts_toward_allocation",
-        "servicenow_allocated", "purchased", "difference_vs_allocated",
+        "asof_servicenow_calc", "servicenow_allocated", "purchased", "difference_vs_allocated",
         "users_with_custom_roles", f"dormant_{cfg.dormant_days}d", "meter_type", "users_file"],
         summary)
     with open(cfg.path("servicenow_diagnostics.txt"), "w", encoding="utf-8") as fh:
         fh.write(f"{SCRIPT_VERSION}\n" + "\n".join(DIAG) + "\n")
     for row in summary:
-        print(f"  {row[0]:<60} {row[1]:<10} counted {row[3]:>9,}  "
-              f"ServiceNow {row[4]:>8}  diff {row[6]}")
+        asof = f"as-of calc {row[4]:>9,}  " if isinstance(row[4], int) else ""
+        print(f"  {row[0]:<60} {row[1]:<10} live {row[3]:>9,}  {asof}"
+              f"ServiceNow {row[5]:>8}")
     print(f"\nFiles written to {cfg.output_dir}")
 
 
