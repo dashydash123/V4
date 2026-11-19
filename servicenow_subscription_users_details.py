@@ -57,7 +57,7 @@ TARGET_SKUS = [
 APP_ENGINE_KEYWORD = "App Engine"   # unmapped custom tables default to App Engine
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
 PAGE_SIZE = 10000
-ROLE_CHUNK = 100
+ROLE_CHUNK = 25          # role sys_ids per sys_user_has_role request (URL length)
 TIMEOUT = 120
 MAX_RETRIES = 5
 
@@ -323,6 +323,12 @@ def pick_field(rows, candidates, predicate=None):
     return None
 
 
+def short_list(items, limit=5):
+    items = sorted(items)
+    extra = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    return ";".join(items[:limit]) + extra
+
+
 def role_scope(role_name):
     """x_abc_app.user -> x_abc_app ; u_role / global -> ''"""
     return role_name.split(".", 1)[0] if role_name.startswith("x_") and "." in role_name else ""
@@ -426,7 +432,19 @@ def build_role_map(sn, subs, role_names, role_types):
                             "sub_id": sid, "table_name": tbl, "role_id": rid,
                             "role_name": rname, "role_type": "",
                             "source": f"app scope match ({source})"})
-        diag(f"  route C (custom role scope -> table scope): {len(mapping) - before:,} mappings")
+        # global custom roles (u_*) can only touch global custom tables (u_*)
+        u_tables = {t: ss for t, ss in table_to_subs.items() if t.startswith("u_")}
+        if u_tables:
+            for rid, rname in role_names.items():
+                if rname.startswith("u_"):
+                    for tbl, sub_set in u_tables.items():
+                        for sid, source in sub_set:
+                            mapping.append({
+                                "sub_id": sid, "table_name": tbl, "role_id": rid,
+                                "role_name": rname, "role_type": "",
+                                "source": f"global custom role ({source})"})
+        diag(f"  route C (custom role scope -> table scope): {len(mapping) - before:,} "
+             f"role/table pairs, {len({m['role_id'] for m in mapping}):,} distinct roles")
 
     # de-duplicate
     seen, out = set(), []
@@ -449,16 +467,77 @@ def write_diagnostics():
 # --------------------------------------------------------------------------- #
 # Step 3: role -> users
 # --------------------------------------------------------------------------- #
+BASIC_HAS_ROLE_FIELDS = ["user", "role", "role.name", "inherited", "granted_by.name",
+                         "included_in_role.name"]
+
+
+def _http_error_text(e):
+    try:
+        return e.read().decode(errors="replace")[:400]
+    except Exception:
+        return ""
+
+
 def fetch_role_holders(sn, role_ids):
     print("\n[3/4] Active users holding those roles (sys_user_has_role)")
     role_ids = sorted(role_ids)
-    rows = []
-    for i in range(0, len(role_ids), ROLE_CHUNK):
-        chunk = role_ids[i:i + ROLE_CHUNK]
+    rows, failed, need_user_details = [], [], False
+
+    def pull(chunk, fields, label):
         q = "user.active=true^roleIN" + ",".join(chunk)
-        rows.extend(sn.table("sys_user_has_role", q, fields=USER_HAS_ROLE_FIELDS,
-                             label=f"role chunk {i // ROLE_CHUNK + 1}"))
+        return sn.table("sys_user_has_role", q, fields=fields, label=label)
+
+    def pull_safe(chunk, label):
+        nonlocal need_user_details
+        try:
+            return pull(chunk, USER_HAS_ROLE_FIELDS, label)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            msg = _http_error_text(e)
+            if len(chunk) > 1:                      # split and retry
+                mid = len(chunk) // 2
+                return pull_safe(chunk[:mid], label + "a") + pull_safe(chunk[mid:], label + "b")
+            try:                                    # single role: retry without dot-walks
+                out = pull(chunk, BASIC_HAS_ROLE_FIELDS, label + " (basic)")
+                need_user_details = True
+                return out
+            except urllib.error.HTTPError as e2:
+                failed.append(chunk[0])
+                diag(f"[WARN] role {chunk[0]} skipped: HTTP {e2.code} "
+                     f"{_http_error_text(e2) or msg}")
+                return []
+
+    total = (len(role_ids) + ROLE_CHUNK - 1) // ROLE_CHUNK
+    for i in range(0, len(role_ids), ROLE_CHUNK):
+        rows.extend(pull_safe(role_ids[i:i + ROLE_CHUNK],
+                              f"role chunk {i // ROLE_CHUNK + 1}/{total}"))
+    if need_user_details:
+        fill_user_details(sn, rows)
+    if failed:
+        diag(f"[WARN] {len(failed)} roles could not be queried (see above)")
     return rows
+
+
+def fill_user_details(sn, rows):
+    """Fetch user columns from sys_user when dot-walked fields were unavailable."""
+    missing = sorted({val(r.get("user")) for r in rows if not r.get("user.user_name")} - {""})
+    if not missing:
+        return
+    fields = ["sys_id", "user_name", "name", "email", "last_login_time",
+              "web_service_access_only", "internal_integration_user", "sys_class_name"]
+    info = {}
+    for i in range(0, len(missing), 50):
+        for u in sn.table("sys_user", "sys_idIN" + ",".join(missing[i:i + 50]),
+                          fields=fields, label="user details", quiet=True):
+            info[u["sys_id"]] = u
+    for r in rows:
+        u = info.get(val(r.get("user")))
+        if u:
+            for f in fields[1:]:
+                r.setdefault("user." + f, u.get(f, ""))
+                if not r.get("user." + f):
+                    r["user." + f] = u.get(f, "")
 
 
 # --------------------------------------------------------------------------- #
@@ -516,9 +595,21 @@ def main():
                         m["role_type"], "Y" if is_custom_role(m["role_name"]) else "N",
                         m["source"]])
 
-    role_to_maps = defaultdict(list)
+    # collapse role/table pairs -> one entry per (role, subscription)
+    collapsed = {}
     for m in role_map:
-        role_to_maps[m["role_id"]].append(m)
+        c = collapsed.setdefault((m["role_id"], m["sub_id"]), {
+            "sub_id": m["sub_id"], "role_type": m["role_type"],
+            "tables": set(), "sources": set()})
+        c["tables"].add(m["table_name"])
+        c["sources"].add(m["source"])
+    role_to_maps = defaultdict(list)
+    for (rid, _), c in collapsed.items():
+        c["table_name"] = short_list(c["tables"])
+        c["source"] = "; ".join(sorted(c["sources"]))
+        role_to_maps[rid].append(c)
+    diag(f"Distinct (role, subscription) pairs to look up: {len(collapsed):,} "
+         f"across {len(role_to_maps):,} roles")
 
     holders = fetch_role_holders(sn, role_to_maps.keys()) if role_to_maps else []
     DIAG.append(f"sys_user_has_role rows for mapped roles (active users): {len(holders):,}")
@@ -561,7 +652,7 @@ def main():
             if is_custom_role(rname):
                 agg["custom_roles"].add(rname)
             agg["role_types"].add(m["role_type"])
-            agg["custom_tables"].add(m["table_name"])
+            agg["custom_tables"].update(m["tables"])
             agg["assignment"].add("direct" if how == "direct" else "inherited")
             detail_rows.append([agg["subscription"], uid, agg["user_name"], agg["email"],
                                 rname, m["role_type"],
@@ -583,7 +674,7 @@ def main():
                         ";".join(sorted(agg["custom_roles"])),
                         ";".join(sorted(agg["roles"])),
                         ";".join(sorted(agg["role_types"])),
-                        ";".join(sorted(agg["custom_tables"])),
+                        short_list(agg["custom_tables"]),
                         ";".join(sorted(agg["assignment"]))])
 
     with open(OUT_USER_ROLES, "w", newline="", encoding="utf-8") as fh:
