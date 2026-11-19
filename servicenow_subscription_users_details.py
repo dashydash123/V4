@@ -1,37 +1,50 @@
 #!/usr/bin/env python3
 """
-servicenow_subscription_users.py
+servicenow_product_users.py
 
-User-level extract for selected ServiceNow subscriptions, with the custom
-roles that tie each user to that subscription.
+Per-product (SKU) user extract from ServiceNow, driven by a .env file.
+For every product in SN_PRODUCTS it writes a separate set of files with the
+users counted against that product, why they count (or don't), and the custom
+roles each user holds.
 
-Mapping chain (as Subscription Management holds it)
-  license_details                 subscription (SKU)
-  ua_custom_table_inventory       custom table -> subscription   (license, table_name)
-  license_role_to_custom_table    custom table -> role           (table_name, sys_user_role, license_role_type)
-  sys_user_has_role               role -> user                   (direct, inherited, via group)
-Fallback if the two middle tables can't be read: the database view
-license_details_assoc_roles (cti_* / ract_* columns).
+How users are found for each product (first rule that applies wins)
+  1. groups      product listed in SN_PRODUCT_GROUPS -> active members of those groups
+  2. all_active  meter type "Unrestricted User"/"Unlimited", or listed in
+                 SN_ALL_USER_PRODUCTS -> every active user on the instance
+                 (ServiceNow counts these instance-wide, not by role)
+  3. uhs         per-user subscriptions -> the user-has-subscription table
+                 (SN_UHS_TABLE / SN_UHS_SUBSCRIPTION_FIELD / SN_UHS_USER_FIELD)
+  4. roles       fallback -> users holding roles mapped to the product's custom tables
 
-Requester-type roles don't consume a subscription, so they're excluded unless
---include-requester is passed.
+ServiceNow's own "active user" rule is applied to every list (column
+counts_toward_allocation): User ID present, not Web service access only,
+not internal integration user, logged in within SN_ACTIVE_LOGIN_DAYS (365).
 
-Outputs (fixed names, overwritten every run - same folder as this script)
-  servicenow_subscription_users.csv        one row per subscription x user
-  servicenow_subscription_user_roles.csv   one row per subscription x user x role
-                                           (direct / inherited / granting group)
-  servicenow_subscription_role_map.csv     subscription -> custom table -> role
-  servicenow_subscriptions.json            raw license_details records
+.env keys (file next to this script, or pass --env <path>)
+  SN_INSTANCE=abinbevww                    bare name, host or full URL
+  SN_CLIENT_ID= / SN_CLIENT_SECRET= / SN_REFRESH_TOKEN=
+  SN_ACCESS_TOKEN=                         optional; used first, refreshed on 401
+  SN_PRODUCTS=Prod A;Prod B                names as in servicenow_available_products.csv
+  SN_PRODUCT_GROUPS=Prod A=Group 1|Group 2;Prod C=Group 3
+  SN_ALL_USER_PRODUCTS=Prod B              force the all-active-users method
+  SN_DORMANT_DAYS=90                       dormant flag (no login in N days / never)
+  SN_ACTIVE_LOGIN_DAYS=365                 ServiceNow allocation login window
+  SN_UHS_TABLE=                            optional; auto-detected if blank
+  SN_UHS_SUBSCRIPTION_FIELD=subscription
+  SN_UHS_USER_FIELD=user
+  SN_PAGE_SIZE=1000
+  SN_OUTPUT_DIR=output                     relative paths are under this script's folder
+  (SN_DIAG_* keys belong to the separate diagnostics script and are ignored here)
 
-.env (same folder)
-  SN_INSTANCE=yourinstance.service-now.com
-  SN_CLIENT_ID=...
-  SN_CLIENT_SECRET=...
-  SN_REFRESH_TOKEN=...
-
-Usage
-  python servicenow_subscription_users.py
-  python servicenow_subscription_users.py --include-requester --lookback-days 365
+Outputs (fixed names, overwritten every run) in SN_OUTPUT_DIR
+  servicenow_available_products.csv        every subscription on the instance
+  servicenow_summary.csv                   one row per selected product
+  servicenow_role_map.csv                  product -> custom table -> role
+  servicenow_subscriptions.json            raw license_details for selected products
+  servicenow_diagnostics.txt               what was read, from where, and warnings
+  <Product_Name>_users.csv                 one row per user
+  <Product_Name>_user_roles.csv            one row per user x custom role
+  <Product_Name>_reconciliation.csv        filter-by-filter count vs ServiceNow allocated
 
 Standard library only (works with the embeddable Python distribution).
 """
@@ -40,6 +53,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -48,33 +62,24 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v6 (2026-11-19: tolerant of single-record / error responses)"
+SCRIPT_VERSION = "v8 (2026-11-19: multi-product .env, per-product files, output dir)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TARGET_SKUS = [
-    "App Engine Enterprise - Unrestricted User",
-    "Customer Service Management Standard - Unrestricted User",
-]
-APP_ENGINE_KEYWORD = "App Engine"   # unmapped custom tables default to App Engine
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
-PAGE_SIZE = 10000
-ROLE_CHUNK = 25          # role sys_ids per sys_user_has_role request (URL length)
+APP_ENGINE_KEYWORD = "app engine"       # unmapped custom tables default to App Engine
+UHS_TABLE_CANDIDATES = ["license_has_user", "sn_sub_man_user_has_subscription",
+                        "sn_sub_man_subscription_user"]
+ROLE_CHUNK = 25
+ID_CHUNK = 100
 TIMEOUT = 120
 MAX_RETRIES = 5
 
-OUT_USERS = os.path.join(SCRIPT_DIR, "servicenow_subscription_users.csv")
-OUT_USER_ROLES = os.path.join(SCRIPT_DIR, "servicenow_subscription_user_roles.csv")
-OUT_ROLE_MAP = os.path.join(SCRIPT_DIR, "servicenow_subscription_role_map.csv")
-OUT_SUBS = os.path.join(SCRIPT_DIR, "servicenow_subscriptions.json")
-OUT_DIAG = os.path.join(SCRIPT_DIR, "servicenow_diagnostics.txt")
-DIAG = []
+USER_FIELDS = ["sys_id", "user_name", "name", "email", "active", "last_login_time",
+               "web_service_access_only", "internal_integration_user", "locked_out",
+               "sys_class_name", "sys_created_on"]
+HAS_ROLE_FIELDS = ["user", "role", "inherited", "granted_by.name", "included_in_role.name"]
 
-USER_HAS_ROLE_FIELDS = [
-    "user", "role", "role.name", "inherited", "granted_by.name", "included_in_role.name",
-    "user.user_name", "user.name", "user.email", "user.last_login_time",
-    "user.web_service_access_only", "user.internal_integration_user",
-    "user.sys_class_name",
-]
+DIAG = []
 
 
 # --------------------------------------------------------------------------- #
@@ -82,25 +87,84 @@ USER_HAS_ROLE_FIELDS = [
 # --------------------------------------------------------------------------- #
 def load_env(path):
     if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as fh:
+        sys.exit(f"[ERROR] .env not found: {path}")
+    with open(path, encoding="utf-8-sig") as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, val = line.split("=", 1)
-            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+            key, value = line.split("=", 1)
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
+def env(name, default=""):
+    return os.environ.get(name, "").strip() or default
+
+
+def env_list(name):
+    return [p.strip() for p in env(name).split(";") if p.strip()]
+
+
+def env_int(name, default):
+    try:
+        return int(env(name, str(default)))
+    except ValueError:
+        sys.exit(f"[ERROR] {name} must be a whole number")
+
+
+def parse_product_groups(raw):
+    """'Prod A=G1|G2 ; Prod B=G3' -> {'prod a': ['G1','G2'], 'prod b': ['G3']}"""
+    out = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        prod, groups = part.split("=", 1)
+        gl = [g.strip() for g in groups.split("|") if g.strip()]
+        if prod.strip() and gl:
+            out[prod.strip().lower()] = gl
+    return out
+
+
+class Config:
+    def __init__(self):
+        self.instance = env("SN_INSTANCE")
+        if not self.instance:
+            sys.exit("[ERROR] SN_INSTANCE missing from .env")
+        self.client_id = env("SN_CLIENT_ID")
+        self.client_secret = env("SN_CLIENT_SECRET")
+        self.refresh_token = env("SN_REFRESH_TOKEN")
+        self.access_token = env("SN_ACCESS_TOKEN")
+        if not self.access_token and not (self.client_id and self.client_secret
+                                          and self.refresh_token):
+            sys.exit("[ERROR] set SN_ACCESS_TOKEN, or SN_CLIENT_ID + SN_CLIENT_SECRET + "
+                     "SN_REFRESH_TOKEN, in .env")
+        self.products = env_list("SN_PRODUCTS")
+        self.product_groups = parse_product_groups(env("SN_PRODUCT_GROUPS"))
+        self.all_user_products = {p.lower() for p in env_list("SN_ALL_USER_PRODUCTS")}
+        self.dormant_days = env_int("SN_DORMANT_DAYS", 90)
+        self.active_login_days = env_int("SN_ACTIVE_LOGIN_DAYS", 365)
+        self.uhs_table = env("SN_UHS_TABLE")
+        self.uhs_sub_field = env("SN_UHS_SUBSCRIPTION_FIELD", "subscription")
+        self.uhs_user_field = env("SN_UHS_USER_FIELD", "user")
+        self.page_size = env_int("SN_PAGE_SIZE", 1000)
+        out = env("SN_OUTPUT_DIR", "output")
+        self.output_dir = out if os.path.isabs(out) else os.path.join(SCRIPT_DIR, out)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def path(self, filename):
+        return os.path.join(self.output_dir, filename)
+
+
+# --------------------------------------------------------------------------- #
+# ServiceNow client
+# --------------------------------------------------------------------------- #
 def normalise_instance(raw):
-    """Accepts 'abinbev', 'abinbev.service-now.com' or a full URL (with or
-    without a trailing path) and returns 'https://<host>'."""
-    raw = raw.strip().strip('"').strip("'")
+    raw = raw.strip()
     if "://" not in raw:
         raw = "https://" + raw
     parsed = urllib.parse.urlparse(raw)
     host = parsed.hostname or ""
-    if host and "." not in host:            # bare instance name
+    if host and "." not in host:
         host = f"{host}.service-now.com"
     if not host:
         sys.exit(f"[ERROR] SN_INSTANCE '{raw}' is not a valid host name")
@@ -111,44 +175,40 @@ def normalise_instance(raw):
 def check_dns(host):
     import socket
     if urllib.request.getproxies().get("https"):
-        return                              # proxy resolves the host for us
+        return
     try:
         socket.getaddrinfo(host, 443)
     except socket.gaierror as e:
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "(none)"
-        sys.exit(
-            f"[ERROR] Cannot resolve host '{host}' ({e}).\n"
-            f"        - Is SN_INSTANCE right? Try:  nslookup {host}\n"
-            f"        - Is VPN / Zscaler connected?\n"
-            f"        - HTTPS_PROXY currently: {proxy}")
+        sys.exit(f"[ERROR] Cannot resolve host '{host}' ({e}). Check SN_INSTANCE, "
+                 f"VPN/Zscaler, or set HTTPS_PROXY.")
 
 
-def require(name):
-    val = os.environ.get(name, "").strip()
-    if not val:
-        sys.exit(f"[ERROR] {name} missing from .env / environment")
-    return val
+def http_error_text(e):
+    try:
+        return e.read().decode(errors="replace")[:400]
+    except Exception:
+        return ""
 
 
-# --------------------------------------------------------------------------- #
-# ServiceNow client (OAuth refresh-token grant, Table API)
-# --------------------------------------------------------------------------- #
 class ServiceNow:
-    def __init__(self):
-        self.base = normalise_instance(require("SN_INSTANCE"))
-        self.host = urllib.parse.urlparse(self.base).hostname
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.base = normalise_instance(cfg.instance)
         print(f"ServiceNow instance: {self.base}")
-        check_dns(self.host)
-        self.client_id = require("SN_CLIENT_ID")
-        self.client_secret = require("SN_CLIENT_SECRET")
-        self.refresh_token = require("SN_REFRESH_TOKEN")
-        self.access_token = None
+        check_dns(urllib.parse.urlparse(self.base).hostname)
+        self.access_token = cfg.access_token
+        self.refresh_token = cfg.refresh_token
+        if not self.access_token:
+            self.authenticate()
+
+    def can_refresh(self):
+        return bool(self.cfg.client_id and self.cfg.client_secret and self.refresh_token)
 
     def authenticate(self):
         body = urllib.parse.urlencode({
             "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
+            "client_id": self.cfg.client_id,
+            "client_secret": self.cfg.client_secret,
             "refresh_token": self.refresh_token,
         }).encode()
         req = urllib.request.Request(
@@ -159,12 +219,9 @@ class ServiceNow:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 data = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
-            sys.exit(f"[ERROR] OAuth token request failed: HTTP {e.code} "
-                     f"{e.read().decode(errors='replace')[:300]}")
+            sys.exit(f"[ERROR] OAuth token request failed: HTTP {e.code} {http_error_text(e)}")
         except urllib.error.URLError as e:
-            sys.exit(f"[ERROR] Could not connect to {self.base}/oauth_token.do: {e.reason}\n"
-                     "        Check SN_INSTANCE, VPN/Zscaler, and HTTPS_PROXY if your "
-                     "network needs a proxy.")
+            sys.exit(f"[ERROR] Could not connect to {self.base}/oauth_token.do: {e.reason}")
         self.access_token = data["access_token"]
         if data.get("refresh_token"):
             self.refresh_token = data["refresh_token"]
@@ -180,10 +237,13 @@ class ServiceNow:
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                if e.code == 401 and not reauthed:
+                if e.code == 401 and not reauthed and self.can_refresh():
                     self.authenticate()
                     reauthed = True
                     continue
+                if e.code == 401:
+                    sys.exit("[ERROR] HTTP 401 - access token expired/invalid and no refresh "
+                             "credentials in .env")
                 if e.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
                     time.sleep(2 ** attempt)
                     continue
@@ -195,13 +255,13 @@ class ServiceNow:
                 raise
         raise RuntimeError(f"GET failed after retries: {url}")
 
-    def table(self, table, query="", fields=None, label=None, quiet=False):
-        rows, offset = [], 0
-        label = label or table
+    def table(self, table, query="", fields=None, label=None, quiet=False, limit=None):
+        rows, offset, label = [], 0, label or table
+        page = self.cfg.page_size
         while True:
             params = {
                 "sysparm_query": query,
-                "sysparm_limit": PAGE_SIZE,
+                "sysparm_limit": min(page, limit) if limit else page,
                 "sysparm_offset": offset,
                 "sysparm_exclude_reference_link": "true",
                 "sysparm_display_value": "false",
@@ -209,31 +269,26 @@ class ServiceNow:
             if fields:
                 params["sysparm_fields"] = ",".join(fields)
             resp = self.get(f"/api/now/table/{table}", params)
-            batch = resp.get("result", []) if isinstance(resp, dict) else resp
-            if isinstance(batch, dict):          # single record or error object
+            raw = resp.get("result", []) if isinstance(resp, dict) else resp
+            batch = raw
+            if isinstance(batch, dict):
                 if "error" in batch or "message" in batch:
-                    DIAG.append(f"[WARN] {label}: ServiceNow returned an error object "
-                                f"at offset {offset}: {json.dumps(batch)[:300]}")
+                    DIAG.append(f"[WARN] {label}: error object at offset {offset}: "
+                                f"{json.dumps(batch)[:300]}")
                     batch = []
                 else:
                     batch = [batch]
             if not isinstance(batch, list):
-                DIAG.append(f"[WARN] {label}: unexpected response type "
-                            f"{type(batch).__name__} at offset {offset}")
+                DIAG.append(f"[WARN] {label}: unexpected response at offset {offset}")
                 batch = []
-            bad = [b for b in batch if not isinstance(b, dict)]
-            if bad:
-                DIAG.append(f"[WARN] {label}: dropped {len(bad)} non-record items "
-                            f"at offset {offset} (e.g. {str(bad[0])[:100]})")
-                batch = [b for b in batch if isinstance(b, dict)]
+            batch = [b for b in batch if isinstance(b, dict)]
             rows.extend(batch)
             if not quiet:
                 print(f"  {label}: {len(rows):,} rows" + " " * 10, end="\r", flush=True)
-            raw_len = len(resp.get("result", [])) if isinstance(resp, dict) and \
-                isinstance(resp.get("result"), list) else len(batch)
-            if raw_len < PAGE_SIZE:
+            raw_len = len(raw) if isinstance(raw, list) else len(batch)
+            if raw_len < params["sysparm_limit"] or (limit and len(rows) >= limit):
                 break
-            offset += PAGE_SIZE
+            offset += params["sysparm_limit"]
         if not quiet:
             print(f"  {label}: {len(rows):,} rows" + " " * 10)
         return rows
@@ -242,6 +297,7 @@ class ServiceNow:
         try:
             return self.table(*args, **kwargs)
         except urllib.error.HTTPError as e:
+            DIAG.append(f"[WARN] {args[0]} not readable (HTTP {e.code}) {http_error_text(e)}")
             print(f"  [WARN] {args[0]} not readable (HTTP {e.code})")
             return None
 
@@ -250,7 +306,6 @@ class ServiceNow:
 # Helpers
 # --------------------------------------------------------------------------- #
 def val(v):
-    """Reference fields can come back as a sys_id string or {'value': ...}."""
     if isinstance(v, dict):
         return v.get("value", "")
     return "" if v is None else str(v)
@@ -271,41 +326,18 @@ def is_custom_role(name):
     return name.startswith(CUSTOM_ROLE_PREFIXES)
 
 
-# --------------------------------------------------------------------------- #
-# Step 1: subscriptions
-# --------------------------------------------------------------------------- #
-def fetch_subscriptions(sn):
-    print("\n[1/4] Subscriptions (license_details)")
-    subs = {}
-    for sku in TARGET_SKUS:
-        recs = sn.try_table("license_details", f"nameLIKE{sku}", label=sku[:45])
-        if recs is None:
-            sys.exit("[ERROR] license_details not readable - the OAuth user needs "
-                     "usage_admin / sn_sub_man.admin (or admin).")
-        if not recs:
-            print(f"  [WARN] no subscription record matches '{sku}'")
-        for r in recs:
-            subs[r["sys_id"]] = r
-    with open(OUT_SUBS, "w", encoding="utf-8") as fh:
-        json.dump(list(subs.values()), fh, indent=2)
-    for r in subs.values():
-        print(f"  - {r.get('name')}  (sys_id {r['sys_id']})")
-    if not subs:
-        sys.exit("[ERROR] none of the target subscriptions were found.")
-    return subs
+def role_scope(name):
+    return name.split(".", 1)[0] if name.startswith("x_") and "." in name else ""
 
 
-# --------------------------------------------------------------------------- #
-# Step 2: subscription -> custom table -> role
-# --------------------------------------------------------------------------- #
-def fetch_role_types(sn):
-    rows = sn.try_table("license_role_type", fields=["sys_id", "name"], quiet=True) or []
-    return {r["sys_id"]: val(r.get("name")) for r in rows}
+def short_list(items, limit=5):
+    items = sorted(i for i in items if i)
+    extra = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    return ";".join(items[:limit]) + extra
 
 
-def fetch_role_names(sn):
-    rows = sn.table("sys_user_role", fields=["sys_id", "name"], label="roles")
-    return {r["sys_id"]: val(r.get("name")) for r in rows}
+def slug(name):
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")[:100] or "product"
 
 
 def diag(msg):
@@ -313,23 +345,14 @@ def diag(msg):
     print("  " + msg)
 
 
-def describe_rows(name, rows):
-    if rows is None:
-        diag(f"{name}: NOT READABLE (HTTP error) - grant read ACL to the API user")
-        return
-    diag(f"{name}: {len(rows):,} rows returned")
-    if not rows:
-        diag(f"  -> 0 rows usually means the API user has no read ACL on {name} "
-             "(ServiceNow returns empty instead of an error)")
-        return
-    sample = {k: val(v) for k, v in rows[0].items() if val(v)}
-    DIAG.append(f"  fields: {', '.join(sorted(rows[0].keys()))}")
-    DIAG.append(f"  sample row: {json.dumps(sample)[:1500]}")
+def write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
 
 
 def pick_field(rows, candidates, predicate=None):
-    """Return the first field name present (non-empty) in rows, from candidates or,
-    if predicate is given, any field whose values satisfy it."""
     keys = set()
     for r in rows[:500]:
         keys.update(k for k, v in r.items() if val(v))
@@ -343,390 +366,444 @@ def pick_field(rows, candidates, predicate=None):
     return None
 
 
-def short_list(items, limit=5):
-    items = sorted(items)
-    extra = f" (+{len(items) - limit} more)" if len(items) > limit else ""
-    return ";".join(items[:limit]) + extra
+# --------------------------------------------------------------------------- #
+# Step 1: products
+# --------------------------------------------------------------------------- #
+def fetch_products(sn, cfg):
+    print("\n[1/6] Subscriptions (license_details)")
+    rows = sn.try_table("license_details", "ORDERBYname", label="subscriptions")
+    if rows is None:
+        sys.exit("[ERROR] license_details not readable - API user needs usage_admin / "
+                 "sn_sub_man.admin (or admin).")
+    cols = ["name", "meter_type", "license_type", "allocated", "count", "allocated_status",
+            "start_date", "end_date", "display_only", "expired", "product_code", "sys_id"]
+    write_csv(cfg.path("servicenow_available_products.csv"), cols,
+              [[val(r.get(c)) for c in cols] for r in rows])
+
+    if not cfg.products:
+        print(f"\nSN_PRODUCTS is empty. Pick names from "
+              f"{cfg.path('servicenow_available_products.csv')} and re-run.")
+        sys.exit(0)
+
+    by_name = defaultdict(list)
+    for r in rows:
+        by_name[val(r.get("name")).strip().lower()].append(r)
+    selected = []
+    for wanted in cfg.products:
+        hits = by_name.get(wanted.lower())
+        if not hits:                                    # fall back to "contains"
+            hits = [r for r in rows if wanted.lower() in val(r.get("name")).lower()]
+        if not hits:
+            diag(f"[WARN] product not found: '{wanted}' (check "
+                 f"servicenow_available_products.csv)")
+            continue
+        for r in hits:
+            if r["sys_id"] not in {s["sys_id"] for s in selected}:
+                r["_requested_as"] = wanted
+                selected.append(r)
+    if not selected:
+        sys.exit("[ERROR] none of SN_PRODUCTS matched a subscription.")
+
+    # disambiguate duplicate names (e.g. same SKU on two contracts)
+    name_count = defaultdict(int)
+    for r in selected:
+        name_count[val(r.get("name"))] += 1
+    for r in selected:
+        n = val(r.get("name"))
+        r["_slug"] = slug(n) if name_count[n] == 1 else \
+            slug(f"{n}_{val(r.get('start_date'))}_{r['sys_id'][:6]}")
+        print(f"  - {n}  [{val(r.get('meter_type')) or val(r.get('license_type'))}]  "
+              f"allocated {val(r.get('allocated'))} / purchased {val(r.get('count'))}")
+    with open(cfg.path("servicenow_subscriptions.json"), "w", encoding="utf-8") as fh:
+        json.dump(selected, fh, indent=2)
+    return selected
 
 
-def role_scope(role_name):
-    """x_abc_app.user -> x_abc_app ; u_role / global -> ''"""
-    return role_name.split(".", 1)[0] if role_name.startswith("x_") and "." in role_name else ""
+def choose_method(cfg, sub):
+    name = val(sub.get("name")).lower()
+    requested = sub.get("_requested_as", "").lower()
+    if name in cfg.product_groups or requested in cfg.product_groups:
+        return "groups"
+    meter = val(sub.get("meter_type")).lower()
+    if "unrestricted" in meter or "unlimited" in meter or \
+            name in cfg.all_user_products or requested in cfg.all_user_products:
+        return "all_active"
+    return "uhs"
 
 
+# --------------------------------------------------------------------------- #
+# Step 2: product -> custom table -> role mapping
+# --------------------------------------------------------------------------- #
 def build_role_map(sn, subs, role_names, role_types):
-    """Returns list of dicts: sub_id, table_name, role_id, role_name, role_type, source."""
-    print("\n[2/4] Subscription -> custom table -> role mapping")
-    app_engine_ids = [sid for sid, s in subs.items()
-                      if APP_ENGINE_KEYWORD.lower() in val(s.get("name")).lower()]
+    print("\n[2/6] Product -> custom table -> role mapping")
+    sub_ids = {s["sys_id"] for s in subs}
+    app_engine_ids = [s["sys_id"] for s in subs
+                      if APP_ENGINE_KEYWORD in val(s.get("name")).lower()]
 
-    # fetch ALL fields (small tables) so field names can be auto-detected
     cti = sn.try_table("ua_custom_table_inventory", label="custom table inventory")
     rtc = sn.try_table("license_role_to_custom_table", label="role-to-custom-table")
-    describe_rows("ua_custom_table_inventory", cti)
-    describe_rows("license_role_to_custom_table", rtc)
+    for name, rows in (("ua_custom_table_inventory", cti),
+                       ("license_role_to_custom_table", rtc)):
+        if rows is None:
+            diag(f"{name}: NOT READABLE")
+        else:
+            diag(f"{name}: {len(rows):,} rows" +
+                 (" (0 rows usually = no read ACL for the API user)" if not rows else ""))
 
-    mapping = []
-
-    # ---- table -> subscription (from custom table inventory) ----
-    table_to_subs = defaultdict(set)
+    mapping, table_to_subs = [], defaultdict(set)
     if cti:
-        sub_f = pick_field(cti, ["license", "subscription", "license_details"],
-                           predicate=lambda v: v in subs)
+        sub_f = pick_field(cti, ["license", "subscription"], predicate=lambda v: v in sub_ids)
         tbl_f = pick_field(cti, ["table_name", "name", "table"])
-        diag(f"custom table inventory: subscription field='{sub_f}', table field='{tbl_f}'")
         if tbl_f:
-            matched = unmapped = 0
             for r in cti:
-                lic, tbl = val(r.get(sub_f)) if sub_f else "", val(r.get(tbl_f))
-                if lic in subs:
+                lic, tbl = (val(r.get(sub_f)) if sub_f else ""), val(r.get(tbl_f))
+                if lic in sub_ids:
                     table_to_subs[tbl].add((lic, "mapped"))
-                    matched += 1
-                elif not lic and app_engine_ids:
+                elif not lic:
                     for sid in app_engine_ids:
                         table_to_subs[tbl].add((sid, "unmapped table (defaults to App Engine)"))
-                    unmapped += 1
-            diag(f"  tables mapped to target subscriptions: {matched:,}; "
-                 f"unmapped (counted to App Engine): {unmapped:,}")
-            other = {val(r.get(sub_f)) for r in cti if sub_f and val(r.get(sub_f))} - set(subs)
-            if other:
-                diag(f"  tables mapped to OTHER subscriptions: {len(other)} distinct "
-                     f"subscription ids (e.g. {sorted(other)[:3]})")
+        diag(f"custom tables attributed to selected products: {len(table_to_subs):,}")
 
-    # ---- route A: role -> table (license_role_to_custom_table) ----
+    # route A: role -> table table
     if table_to_subs and rtc:
         role_f = pick_field(rtc, ["sys_user_role", "role"], predicate=lambda v: v in role_names)
-        tbl_f = pick_field(rtc, ["table_name", "table", "name"],
-                           predicate=lambda v: v in table_to_subs)
+        tbl_f = pick_field(rtc, ["table_name", "table"], predicate=lambda v: v in table_to_subs)
         type_f = pick_field(rtc, ["license_role_type", "role_type"])
-        diag(f"role-to-custom-table: role field='{role_f}', table field='{tbl_f}', "
-             f"type field='{type_f}'")
         if role_f and tbl_f:
             for r in rtc:
                 if r.get("active") not in (None, "") and not is_true(r.get("active")):
                     continue
                 tbl, rid = val(r.get(tbl_f)), val(r.get(role_f))
                 rtype = val(r.get(type_f)) if type_f else ""
-                for sid, source in table_to_subs.get(tbl, ()):
-                    mapping.append({
-                        "sub_id": sid, "table_name": tbl, "role_id": rid,
-                        "role_name": role_names.get(rid, rid),
-                        "role_type": role_types.get(rtype, rtype),
-                        "source": source})
-            diag(f"  route A (role-to-custom-table): {len(mapping):,} mappings")
+                for sid, src in table_to_subs.get(tbl, ()):
+                    mapping.append((sid, tbl, rid, role_types.get(rtype, rtype), src))
+        diag(f"route A (license_role_to_custom_table): {len(mapping):,} pairs")
 
-    # ---- route B: database view ----
+    # route B: database view
     if not mapping:
-        print("  Trying database view license_details_assoc_roles")
-        q = "cti_licenseIN" + ",".join(subs)
-        view = sn.try_table("license_details_assoc_roles", q,
+        view = sn.try_table("license_details_assoc_roles", "cti_licenseIN" + ",".join(sub_ids),
                             fields=["cti_license", "cti_table_name", "ract_sys_user_role",
-                                    "ract_license_role_type", "ract_role_name"],
-                            label="assoc roles view") or []
+                                    "ract_license_role_type"], label="assoc roles view") or []
         for r in view:
             rid = val(r.get("ract_sys_user_role"))
-            if not rid:
-                continue
-            mapping.append({
-                "sub_id": val(r.get("cti_license")), "table_name": val(r.get("cti_table_name")),
-                "role_id": rid,
-                "role_name": role_names.get(rid, val(r.get("ract_role_name"))),
-                "role_type": role_types.get(val(r.get("ract_license_role_type")),
-                                            val(r.get("ract_license_role_type"))),
-                "source": "mapped (view)"})
-        diag(f"  route B (assoc roles view): {len(mapping):,} mappings")
+            if rid:
+                rt = val(r.get("ract_license_role_type"))
+                mapping.append((val(r.get("cti_license")), val(r.get("cti_table_name")), rid,
+                                role_types.get(rt, rt), "mapped (view)"))
+        diag(f"route B (license_details_assoc_roles): {len(mapping):,} pairs")
 
-    # ---- route C: custom role scope -> custom table scope ----
-    # x_abc_app.user grants access to tables x_abc_app_* ; if those tables are
-    # mapped to a target subscription, the role is attributed to it.
+    # route C: custom role scope -> custom table scope
     if not mapping and table_to_subs:
-        before = len(mapping)
         for rid, rname in role_names.items():
             scope = role_scope(rname)
-            if not scope:
-                continue
             for tbl, sub_set in table_to_subs.items():
-                if tbl.startswith(scope + "_") or tbl == scope:
-                    for sid, source in sub_set:
-                        mapping.append({
-                            "sub_id": sid, "table_name": tbl, "role_id": rid,
-                            "role_name": rname, "role_type": "",
-                            "source": f"app scope match ({source})"})
-        # global custom roles (u_*) can only touch global custom tables (u_*)
-        u_tables = {t: ss for t, ss in table_to_subs.items() if t.startswith("u_")}
-        if u_tables:
-            for rid, rname in role_names.items():
-                if rname.startswith("u_"):
-                    for tbl, sub_set in u_tables.items():
-                        for sid, source in sub_set:
-                            mapping.append({
-                                "sub_id": sid, "table_name": tbl, "role_id": rid,
-                                "role_name": rname, "role_type": "",
-                                "source": f"global custom role ({source})"})
-        diag(f"  route C (custom role scope -> table scope): {len(mapping) - before:,} "
-             f"role/table pairs, {len({m['role_id'] for m in mapping}):,} distinct roles")
+                if (scope and (tbl.startswith(scope + "_") or tbl == scope)) or \
+                        (rname.startswith("u_") and tbl.startswith("u_")):
+                    for sid, src in sub_set:
+                        mapping.append((sid, tbl, rid, "", f"app scope match ({src})"))
+        diag(f"route C (role/table name-prefix match): {len(mapping):,} pairs")
 
-    # de-duplicate
-    seen, out = set(), []
-    for m in mapping:
-        k = (m["sub_id"], m["table_name"], m["role_id"])
-        if k not in seen:
-            seen.add(k)
-            out.append(m)
-    if not out:
-        diag("[WARN] no role mappings found for the target subscriptions - see "
-             "servicenow_diagnostics.txt")
-    return out
+    mapping = sorted(set(mapping))
+    dropped = [m for m in mapping if "requester" in m[3].lower()]
+    mapping = [m for m in mapping if "requester" not in m[3].lower()]
+    if dropped:
+        diag(f"dropped {len(dropped)} Requester-type role mappings")
 
-
-def write_diagnostics():
-    with open(OUT_DIAG, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(DIAG) + "\n")
+    # per product: role_id -> {tables, type, source}
+    by_sub = defaultdict(lambda: defaultdict(lambda: {"tables": set(), "type": "",
+                                                       "sources": set()}))
+    for sid, tbl, rid, rtype, src in mapping:
+        e = by_sub[sid][rid]
+        e["tables"].add(tbl)
+        e["type"] = e["type"] or rtype
+        e["sources"].add(src)
+    return mapping, by_sub
 
 
 # --------------------------------------------------------------------------- #
-# Step 3: role -> users
+# Step 3: custom-role holders (role -> users)
 # --------------------------------------------------------------------------- #
-BASIC_HAS_ROLE_FIELDS = ["user", "role", "role.name", "inherited", "granted_by.name",
-                         "included_in_role.name"]
-
-
-def _http_error_text(e):
-    try:
-        return e.read().decode(errors="replace")[:400]
-    except Exception:
-        return ""
-
-
-def fetch_role_holders(sn, role_ids):
-    print("\n[3/4] Active users holding those roles (sys_user_has_role)")
+def fetch_role_holders(sn, role_ids, role_names):
+    print("\n[3/6] Users holding custom / mapped roles (sys_user_has_role)")
     role_ids = sorted(role_ids)
-    rows, failed, need_user_details = [], [], False
+    failed = []
 
-    def pull(chunk, fields, label):
-        q = "user.active=true^roleIN" + ",".join(chunk)
-        return sn.table("sys_user_has_role", q, fields=fields, label=label)
-
-    def pull_safe(chunk, label):
-        nonlocal need_user_details
+    def pull(chunk, label):
         try:
-            return pull(chunk, USER_HAS_ROLE_FIELDS, label)
+            return sn.table("sys_user_has_role", "user.active=true^roleIN" + ",".join(chunk),
+                            fields=HAS_ROLE_FIELDS, label=label)
         except urllib.error.HTTPError as e:
             if e.code != 400:
                 raise
-            msg = _http_error_text(e)
-            if len(chunk) > 1:                      # split and retry
+            if len(chunk) > 1:
                 mid = len(chunk) // 2
-                return pull_safe(chunk[:mid], label + "a") + pull_safe(chunk[mid:], label + "b")
-            try:                                    # single role: retry without dot-walks
-                out = pull(chunk, BASIC_HAS_ROLE_FIELDS, label + " (basic)")
-                need_user_details = True
-                return out
-            except urllib.error.HTTPError as e2:
-                failed.append(chunk[0])
-                diag(f"[WARN] role {chunk[0]} skipped: HTTP {e2.code} "
-                     f"{_http_error_text(e2) or msg}")
-                return []
+                return pull(chunk[:mid], label + "a") + pull(chunk[mid:], label + "b")
+            failed.append(chunk[0])
+            diag(f"[WARN] role {role_names.get(chunk[0], chunk[0])} skipped: HTTP 400 "
+                 f"{http_error_text(e)}")
+            return []
 
     total = (len(role_ids) + ROLE_CHUNK - 1) // ROLE_CHUNK
+    rows = []
     for i in range(0, len(role_ids), ROLE_CHUNK):
-        rows.extend(pull_safe(role_ids[i:i + ROLE_CHUNK],
-                              f"role chunk {i // ROLE_CHUNK + 1}/{total}"))
-    if need_user_details:
-        fill_user_details(sn, rows)
-    if failed:
-        diag(f"[WARN] {len(failed)} roles could not be queried (see above)")
-    return rows
+        rows.extend(pull(role_ids[i:i + ROLE_CHUNK], f"role chunk {i // ROLE_CHUNK + 1}/{total}"))
+
+    # user -> role -> set(how assigned)
+    held = defaultdict(lambda: defaultdict(set))
+    for h in rows:
+        uid, rid = val(h.get("user")), val(h.get("role"))
+        if not uid or not rid:
+            continue
+        g, inc = val(h.get("granted_by.name")), val(h.get("included_in_role.name"))
+        how = (f"group: {g}" if g else f"contained in role: {inc}" if inc
+               else "inherited" if is_true(h.get("inherited")) else "direct")
+        held[uid][rid].add(how)
+    diag(f"role assignments read: {len(rows):,}; users with custom/mapped roles: {len(held):,}")
+    return held
 
 
-def fill_user_details(sn, rows):
-    """Fetch user columns from sys_user when dot-walked fields were unavailable."""
-    missing = sorted({val(r.get("user")) for r in rows if not r.get("user.user_name")} - {""})
-    if not missing:
-        return
-    fields = ["sys_id", "user_name", "name", "email", "last_login_time",
-              "web_service_access_only", "internal_integration_user", "sys_class_name"]
-    info = {}
-    for i in range(0, len(missing), 50):
-        for u in sn.table("sys_user", "sys_idIN" + ",".join(missing[i:i + 50]),
-                          fields=fields, label="user details", quiet=True):
-            info[u["sys_id"]] = u
+# --------------------------------------------------------------------------- #
+# Step 4: users per product
+# --------------------------------------------------------------------------- #
+class UserCache:
+    def __init__(self, sn):
+        self.sn, self.users, self.have_all_active = sn, {}, False
+
+    def load_all_active(self):
+        if not self.have_all_active:
+            for u in self.sn.table("sys_user", "active=true^ORDERBYsys_id",
+                                   fields=USER_FIELDS, label="active users"):
+                self.users[u["sys_id"]] = u
+            self.have_all_active = True
+        return [u for u in self.users.values() if is_true(u.get("active"))]
+
+    def get(self, ids):
+        missing = sorted(set(ids) - set(self.users))
+        for i in range(0, len(missing), ID_CHUNK):
+            for u in self.sn.table("sys_user", "sys_idIN" + ",".join(missing[i:i + ID_CHUNK]),
+                                   fields=USER_FIELDS, label="user details", quiet=True):
+                self.users[u["sys_id"]] = u
+        return [self.users[i] for i in ids if i in self.users]
+
+
+def users_from_groups(sn, groups):
+    q = "^OR".join(f"group.name={g}" for g in groups) + "^user.active=true"
+    rows = sn.try_table("sys_user_grmember", q, fields=["user", "group.name"],
+                        label="group members") or []
+    found = {val(r.get("group.name")) for r in rows}
+    for g in groups:
+        if g not in found:
+            diag(f"[WARN] group '{g}' returned no active members (check exact name)")
+    by_user = defaultdict(set)
     for r in rows:
-        u = info.get(val(r.get("user")))
-        if u:
-            for f in fields[1:]:
-                r.setdefault("user." + f, u.get(f, ""))
-                if not r.get("user." + f):
-                    r["user." + f] = u.get(f, "")
+        by_user[val(r.get("user"))].add(val(r.get("group.name")))
+    return by_user
+
+
+def users_from_uhs(sn, cfg, sub):
+    """Per-user subscription allocations from the user-has-subscription table."""
+    sid = sub["sys_id"]
+    tables = [cfg.uhs_table] if cfg.uhs_table else UHS_TABLE_CANDIDATES
+    for tbl in tables:
+        try:   # probe: is the field valid? (ServiceNow ignores unknown fields in queries)
+            probe = sn.get(f"/api/now/table/{tbl}", {
+                "sysparm_query": f"{cfg.uhs_sub_field}={sid}", "sysparm_limit": 1,
+                "sysparm_exclude_reference_link": "true"}).get("result", [])
+        except urllib.error.HTTPError as e:
+            DIAG.append(f"  uhs table {tbl}: HTTP {e.code}")
+            continue
+        if not probe or val(probe[0].get(cfg.uhs_sub_field)) != sid:
+            DIAG.append(f"  uhs table {tbl}: no rows with {cfg.uhs_sub_field}={sid}")
+            continue
+        rows = sn.table(tbl, f"{cfg.uhs_sub_field}={sid}",
+                        fields=[cfg.uhs_user_field, cfg.uhs_sub_field], label=f"{tbl}")
+        users = {val(r.get(cfg.uhs_user_field)) for r in rows
+                 if val(r.get(cfg.uhs_sub_field)) == sid}
+        diag(f"uhs: {len(users):,} users from {tbl}.{cfg.uhs_user_field}")
+        return users, tbl
+    return None, None
+
+
+def classify(u, cfg, now):
+    last = parse_dt(u.get("last_login_time"))
+    days = (now - last).days if last else ""
+    if not val(u.get("user_name")).strip():
+        reason = "empty_user_id"
+    elif is_true(u.get("web_service_access_only")):
+        reason = "web_service_access_only"
+    elif is_true(u.get("internal_integration_user")):
+        reason = "internal_integration_user"
+    elif last is None:
+        reason = "never_logged_in"
+    elif days > cfg.active_login_days:
+        reason = f"no_login_last_{cfg.active_login_days}d"
+    else:
+        reason = ""
+    dormant = "Y" if last is None or days > cfg.dormant_days else "N"
+    return reason, days, dormant
+
+
+RECON_STEPS = ["empty_user_id", "web_service_access_only", "internal_integration_user",
+               "never_logged_in"]
+
+
+def write_product_files(cfg, sub, method, population, extra, held, role_names,
+                        sub_roles, now):
+    """population: list of sys_user dicts. extra: uid -> text (groups / source)."""
+    base = sub["_slug"]
+    name = val(sub.get("name"))
+    allocated = val(sub.get("allocated"))
+    sub_role_ids = set(sub_roles)
+
+    user_rows, role_rows, reason_count = [], [], defaultdict(int)
+    n_custom = n_dormant = 0
+    for u in population:
+        uid = u["sys_id"]
+        reason, days, dormant = classify(u, cfg, now)
+        reason_count[reason] += 1
+        roles = held.get(uid, {})
+        custom_all = sorted(role_names.get(r, r) for r in roles
+                            if is_custom_role(role_names.get(r, r)))
+        for_product = sorted(role_names.get(r, r) for r in roles if r in sub_role_ids)
+        tables = set()
+        for r in roles:
+            if r in sub_roles:
+                tables.update(sub_roles[r]["tables"])
+        how = sorted({h for r in roles for h in roles[r]})
+        n_custom += bool(custom_all)
+        n_dormant += dormant == "Y"
+        user_rows.append([
+            name, method, uid, val(u.get("user_name")), val(u.get("name")),
+            val(u.get("email")), val(u.get("sys_class_name")), val(u.get("last_login_time")),
+            days, dormant, val(u.get("web_service_access_only")),
+            "N" if reason else "Y", reason,
+            "Y" if custom_all else "N", ";".join(for_product), ";".join(custom_all),
+            short_list(tables), short_list(how, 3), extra.get(uid, "")])
+        for r in roles:
+            rn = role_names.get(r, r)
+            if is_custom_role(rn) or r in sub_role_ids:
+                for h in sorted(roles[r]):
+                    role_rows.append([name, uid, val(u.get("user_name")), val(u.get("email")),
+                                      rn, "Y" if is_custom_role(rn) else "N",
+                                      "Y" if r in sub_role_ids else "N",
+                                      sub_roles[r]["type"] if r in sub_roles else "",
+                                      short_list(sub_roles[r]["tables"]) if r in sub_roles
+                                      else "", h])
+
+    write_csv(cfg.path(f"{base}_users.csv"), [
+        "product", "method", "user_sys_id", "user_name", "name", "email", "user_class",
+        "last_login_time", "days_since_login", f"dormant_{cfg.dormant_days}d",
+        "web_service_access_only", "counts_toward_allocation", "exclusion_reason",
+        "has_custom_role", "custom_roles_for_product", "all_custom_roles",
+        "custom_tables_for_product", "role_assignment", "source_detail"], user_rows)
+    write_csv(cfg.path(f"{base}_user_roles.csv"), [
+        "product", "user_sys_id", "user_name", "email", "role", "is_custom_role",
+        "mapped_to_product", "role_type", "custom_tables", "assigned_via"], role_rows)
+
+    # reconciliation
+    target = int(allocated) if allocated.isdigit() else None
+    running = len(population)
+    recon = [("Users found (" + method + ")", running)]
+    labels = {"empty_user_id": "excluding empty User ID",
+              "web_service_access_only": "excluding Web service access only",
+              "internal_integration_user": "excluding internal integration users",
+              "never_logged_in": "excluding never logged in"}
+    for st in RECON_STEPS:
+        running -= reason_count[st]
+        recon.append((labels[st], running))
+    running -= reason_count[f"no_login_last_{cfg.active_login_days}d"]
+    recon.append((f"excluding no login in last {cfg.active_login_days} days", running))
+    write_csv(cfg.path(f"{base}_reconciliation.csv"),
+              ["cumulative_filter", "users", "servicenow_allocated", "difference"],
+              [[lbl, n, allocated, (n - target) if target is not None else ""]
+               for lbl, n in recon])
+    counted = recon[-1][1]
+    print(f"\n  {name}  [{method}]")
+    for lbl, n in recon:
+        print(f"    {lbl:<45}{n:>10,}" +
+              (f"   vs ServiceNow {target:,}: {n - target:+,}" if target is not None else ""))
+    return [name, method, len(population), counted, allocated, val(sub.get("count")),
+            (counted - target) if target is not None else "", n_custom, n_dormant,
+            val(sub.get("meter_type")), f"{base}_users.csv"]
 
 
 # --------------------------------------------------------------------------- #
-# Step 4: assemble
-# --------------------------------------------------------------------------- #
-def counts_reason(rec, cutoff, lookback_days):
-    if not val(rec.get("user.user_name")).strip():
-        return "empty_user_id"
-    if is_true(rec.get("user.web_service_access_only")):
-        return "web_service_access_only"
-    if is_true(rec.get("user.internal_integration_user")):
-        return "internal_integration_user"
-    last = parse_dt(rec.get("user.last_login_time"))
-    if last is None:
-        return "never_logged_in"
-    if last < cutoff:
-        return f"no_login_last_{lookback_days}d"
-    return ""
-
-
 def main():
-    ap = argparse.ArgumentParser(description="ServiceNow subscription users + custom roles")
-    ap.add_argument("--include-requester", action="store_true",
-                    help="keep Requester-type roles (normally non-licensable)")
-    ap.add_argument("--lookback-days", type=int, default=365,
-                    help="login window used for the active_per_servicenow flag")
+    ap = argparse.ArgumentParser(description="ServiceNow per-product user extract")
+    ap.add_argument("--env", default=os.path.join(SCRIPT_DIR, ".env"),
+                    help="path to the .env file (default: .env next to this script)")
     args = ap.parse_args()
 
-    print(f"servicenow_subscription_users {SCRIPT_VERSION}")
-    load_env(os.path.join(SCRIPT_DIR, ".env"))
-    sn = ServiceNow()
-    sn.authenticate()
+    print(f"servicenow_product_users {SCRIPT_VERSION}")
+    load_env(args.env)
+    cfg = Config()
+    print(f"Output folder: {cfg.output_dir}")
+    sn = ServiceNow(cfg)
+    now = datetime.now(timezone.utc)
 
-    subs = fetch_subscriptions(sn)
-    for sid, r in subs.items():
-        DIAG.append(f"subscription: {val(r.get('name'))} | sys_id {sid}")
-    role_types = fetch_role_types(sn)
-    role_names = fetch_role_names(sn)
-    DIAG.append(f"license_role_type rows: {len(role_types)} -> {sorted(set(role_types.values()))}")
-    DIAG.append(f"sys_user_role rows: {len(role_names):,} "
-                f"(custom x_/u_: {sum(1 for n in role_names.values() if is_custom_role(n)):,})")
-    role_map = build_role_map(sn, subs, role_names, role_types)
+    subs = fetch_products(sn, cfg)
+    methods = {s["sys_id"]: choose_method(cfg, s) for s in subs}
 
-    if not args.include_requester:
-        before = len(role_map)
-        role_map = [m for m in role_map if "requester" not in m["role_type"].strip().lower()]
-        diag(f"Dropped {before - len(role_map)} Requester-type role mappings "
-             f"({len(role_map)} left)")
+    role_types = {r["sys_id"]: val(r.get("name")) for r in
+                  (sn.try_table("license_role_type", fields=["sys_id", "name"], quiet=True)
+                   or [])}
+    role_names = {r["sys_id"]: val(r.get("name")) for r in
+                  sn.table("sys_user_role", fields=["sys_id", "name"], label="roles")}
+    mapping, by_sub = build_role_map(sn, subs, role_names, role_types)
+    write_csv(cfg.path("servicenow_role_map.csv"),
+              ["product", "custom_table", "role", "role_type", "is_custom_role", "mapping_source"],
+              [[val(next(s for s in subs if s["sys_id"] == sid).get("name")), tbl,
+                role_names.get(rid, rid), rt, "Y" if is_custom_role(role_names.get(rid, rid))
+                else "N", src] for sid, tbl, rid, rt, src in mapping])
 
-    with open(OUT_ROLE_MAP, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["subscription", "custom_table", "role", "role_type",
-                    "is_custom_role", "mapping_source"])
-        for m in sorted(role_map, key=lambda x: (x["sub_id"], x["table_name"], x["role_name"])):
-            w.writerow([val(subs[m["sub_id"]].get("name")), m["table_name"], m["role_name"],
-                        m["role_type"], "Y" if is_custom_role(m["role_name"]) else "N",
-                        m["source"]])
+    wanted_roles = {r for r, n in role_names.items() if is_custom_role(n)}
+    for sid in by_sub:
+        wanted_roles.update(by_sub[sid])
+    held = fetch_role_holders(sn, wanted_roles, role_names) if wanted_roles else {}
 
-    # collapse role/table pairs -> one entry per (role, subscription)
-    collapsed = {}
-    for m in role_map:
-        c = collapsed.setdefault((m["role_id"], m["sub_id"]), {
-            "sub_id": m["sub_id"], "role_type": m["role_type"],
-            "tables": set(), "sources": set()})
-        c["tables"].add(m["table_name"])
-        c["sources"].add(m["source"])
-    role_to_maps = defaultdict(list)
-    for (rid, _), c in collapsed.items():
-        c["table_name"] = short_list(c["tables"])
-        c["source"] = "; ".join(sorted(c["sources"]))
-        role_to_maps[rid].append(c)
-    diag(f"Distinct (role, subscription) pairs to look up: {len(collapsed):,} "
-         f"across {len(role_to_maps):,} roles")
+    print("\n[4/6] Users per product")
+    cache = UserCache(sn)
+    summary = []
+    for sub in subs:
+        sid, name = sub["sys_id"], val(sub.get("name"))
+        method, extra = methods[sid], {}
+        if method == "groups":
+            groups = cfg.product_groups.get(name.lower()) or \
+                cfg.product_groups.get(sub.get("_requested_as", "").lower(), [])
+            by_user = users_from_groups(sn, groups)
+            population = cache.get(sorted(by_user))
+            extra = {u: "groups: " + ";".join(sorted(g)) for u, g in by_user.items()}
+        elif method == "all_active":
+            population = cache.load_all_active()
+            extra = {}
+        else:
+            ids, tbl = users_from_uhs(sn, cfg, sub)
+            if ids is not None:
+                population = cache.get(sorted(ids))
+                extra = {u: f"allocated in {tbl}" for u in ids}
+            else:
+                method = "roles"
+                ids = sorted(u for u, roles in held.items() if set(roles) & set(by_sub[sid]))
+                diag(f"[WARN] {name}: no user-has-subscription table found - using holders "
+                     f"of roles mapped to this product ({len(ids):,} users). Set SN_UHS_TABLE "
+                     f"to the table your other script uses.")
+                population = cache.get(ids)
+        print(f"\n[5/6] Writing files for {name}")
+        summary.append(write_product_files(cfg, sub, method, population, extra, held,
+                                           role_names, by_sub.get(sid, {}), now))
 
-    holders = fetch_role_holders(sn, role_to_maps.keys()) if role_to_maps else []
-    DIAG.append(f"sys_user_has_role rows for mapped roles (active users): {len(holders):,}")
-    if role_to_maps and not holders:
-        DIAG.append("  -> 0 rows: check the API user can read sys_user_has_role")
-
-    print("\n[4/4] Building user files")
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
-    users = {}                          # (sub_id, user_id) -> aggregate
-    detail_rows = []
-    for h in holders:
-        if not isinstance(h, dict):
-            continue
-        uid, rid = val(h.get("user")), val(h.get("role"))
-        rname = val(h.get("role.name")) or role_names.get(rid, rid)
-        inherited = is_true(h.get("inherited"))
-        via_group = val(h.get("granted_by.name"))
-        via_role = val(h.get("included_in_role.name"))
-        how = ("group: " + via_group) if via_group else \
-              ("contained in role: " + via_role) if via_role else \
-              ("inherited" if inherited else "direct")
-        for m in role_to_maps.get(rid, ()):
-            key = (m["sub_id"], uid)
-            agg = users.get(key)
-            if agg is None:
-                reason = counts_reason(h, cutoff, args.lookback_days)
-                agg = users[key] = {
-                    "subscription": val(subs[m["sub_id"]].get("name")),
-                    "user_sys_id": uid,
-                    "user_name": val(h.get("user.user_name")),
-                    "name": val(h.get("user.name")),
-                    "email": val(h.get("user.email")),
-                    "last_login_time": val(h.get("user.last_login_time")),
-                    "user_class": val(h.get("user.sys_class_name")),
-                    "web_service_access_only": val(h.get("user.web_service_access_only")),
-                    "active_per_servicenow": "N" if reason else "Y",
-                    "exclusion_reason": reason,
-                    "roles": set(), "custom_roles": set(), "role_types": set(),
-                    "custom_tables": set(), "assignment": set(),
-                }
-            agg["roles"].add(rname)
-            if is_custom_role(rname):
-                agg["custom_roles"].add(rname)
-            agg["role_types"].add(m["role_type"])
-            agg["custom_tables"].update(m["tables"])
-            agg["assignment"].add("direct" if how == "direct" else "inherited")
-            detail_rows.append([agg["subscription"], uid, agg["user_name"], agg["email"],
-                                rname, m["role_type"],
-                                "Y" if is_custom_role(rname) else "N",
-                                m["table_name"], how, m["source"]])
-
-    user_cols = ["subscription", "user_sys_id", "user_name", "name", "email",
-                 "last_login_time", "user_class", "web_service_access_only",
-                 "active_per_servicenow", "exclusion_reason", "custom_roles",
-                 "all_mapped_roles", "role_types", "custom_tables", "assignment"]
-    with open(OUT_USERS, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(user_cols)
-        for agg in sorted(users.values(), key=lambda a: (a["subscription"], a["user_name"])):
-            w.writerow([agg["subscription"], agg["user_sys_id"], agg["user_name"], agg["name"],
-                        agg["email"], agg["last_login_time"], agg["user_class"],
-                        agg["web_service_access_only"], agg["active_per_servicenow"],
-                        agg["exclusion_reason"],
-                        ";".join(sorted(agg["custom_roles"])),
-                        ";".join(sorted(agg["roles"])),
-                        ";".join(sorted(agg["role_types"])),
-                        short_list(agg["custom_tables"]),
-                        ";".join(sorted(agg["assignment"]))])
-
-    with open(OUT_USER_ROLES, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["subscription", "user_sys_id", "user_name", "email", "role", "role_type",
-                    "is_custom_role", "custom_table", "assigned_via", "mapping_source"])
-        w.writerows(detail_rows)
-
-    # ---- summary ----
-    print("\n=== Summary ===")
-    for sid, s in subs.items():
-        name = val(s.get("name"))
-        recs = [a for (k_sid, _), a in users.items() if k_sid == sid]
-        n_roles = len({m["role_id"] for m in role_map if m["sub_id"] == sid})
-        n_tables = len({m["table_name"] for m in role_map if m["sub_id"] == sid})
-        print(f"\n  {name}")
-        print(f"    custom tables mapped           : {n_tables:,}")
-        print(f"    licensable roles on them       : {n_roles:,}")
-        print(f"    active users holding them      : {len(recs):,}")
-        print(f"      ...with a custom (x_/u_) role: "
-              f"{sum(1 for a in recs if a['custom_roles']):,}")
-        print(f"      ...logged in last {args.lookback_days}d, "
-              f"not web-service: {sum(1 for a in recs if a['active_per_servicenow'] == 'Y'):,}")
-        for k in sorted(s):
-            if any(t in k for t in ("alloc", "purchas", "count")) and val(s[k]):
-                print(f"    license_details.{k:<15}: {val(s[k])}")
-    write_diagnostics()
-    print(f"\nWritten:\n  {OUT_USERS}\n  {OUT_USER_ROLES}\n  {OUT_ROLE_MAP}\n  {OUT_SUBS}"
-          f"\n  {OUT_DIAG}")
+    print("\n[6/6] Summary")
+    write_csv(cfg.path("servicenow_summary.csv"), [
+        "product", "method", "users_found", "counts_toward_allocation",
+        "servicenow_allocated", "purchased", "difference_vs_allocated",
+        "users_with_custom_roles", f"dormant_{cfg.dormant_days}d", "meter_type", "users_file"],
+        summary)
+    with open(cfg.path("servicenow_diagnostics.txt"), "w", encoding="utf-8") as fh:
+        fh.write(f"{SCRIPT_VERSION}\n" + "\n".join(DIAG) + "\n")
+    for row in summary:
+        print(f"  {row[0]:<60} {row[1]:<10} counted {row[3]:>9,}  "
+              f"ServiceNow {row[4]:>8}  diff {row[6]}")
+    print(f"\nFiles written to {cfg.output_dir}")
 
 
 if __name__ == "__main__":
