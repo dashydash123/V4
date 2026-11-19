@@ -48,6 +48,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+SCRIPT_VERSION = "v5 (2026-11-19: chunked role lookup, 400 split/retry)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 TARGET_SKUS = [
@@ -566,6 +567,7 @@ def main():
                     help="login window used for the active_per_servicenow flag")
     args = ap.parse_args()
 
+    print(f"servicenow_subscription_users {SCRIPT_VERSION}")
     load_env(os.path.join(SCRIPT_DIR, ".env"))
     sn = ServiceNow()
     sn.authenticate()
