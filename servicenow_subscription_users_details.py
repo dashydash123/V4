@@ -62,7 +62,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v8 (2026-11-19: multi-product .env, per-product files, output dir)"
+SCRIPT_VERSION = "v9 (2026-11-19: sys_created_on + created-after-last-calc check)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -656,11 +656,16 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
     sub_role_ids = set(sub_roles)
 
     user_rows, role_rows, reason_count = [], [], defaultdict(int)
+    calc_on = parse_dt(sub.get("last_allocation_cal_on"))
+    n_new_after_calc = 0
     n_custom = n_dormant = 0
     for u in population:
         uid = u["sys_id"]
         reason, days, dormant = classify(u, cfg, now)
         reason_count[reason] += 1
+        created = parse_dt(u.get("sys_created_on"))
+        if calc_on and not reason and created and created > calc_on:
+            n_new_after_calc += 1
         roles = held.get(uid, {})
         custom_all = sorted(role_names.get(r, r) for r in roles
                             if is_custom_role(role_names.get(r, r)))
@@ -674,8 +679,8 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
         n_dormant += dormant == "Y"
         user_rows.append([
             name, method, uid, val(u.get("user_name")), val(u.get("name")),
-            val(u.get("email")), val(u.get("sys_class_name")), val(u.get("last_login_time")),
-            days, dormant, val(u.get("web_service_access_only")),
+            val(u.get("email")), val(u.get("sys_class_name")), val(u.get("sys_created_on")),
+            val(u.get("last_login_time")), days, dormant, val(u.get("web_service_access_only")),
             "N" if reason else "Y", reason,
             "Y" if custom_all else "N", ";".join(for_product), ";".join(custom_all),
             short_list(tables), short_list(how, 3), extra.get(uid, "")])
@@ -692,7 +697,7 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
 
     write_csv(cfg.path(f"{base}_users.csv"), [
         "product", "method", "user_sys_id", "user_name", "name", "email", "user_class",
-        "last_login_time", "days_since_login", f"dormant_{cfg.dormant_days}d",
+        "sys_created_on", "last_login_time", "days_since_login", f"dormant_{cfg.dormant_days}d",
         "web_service_access_only", "counts_toward_allocation", "exclusion_reason",
         "has_custom_role", "custom_roles_for_product", "all_custom_roles",
         "custom_tables_for_product", "role_assignment", "source_detail"], user_rows)
@@ -713,15 +718,27 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
         recon.append((labels[st], running))
     running -= reason_count[f"no_login_last_{cfg.active_login_days}d"]
     recon.append((f"excluding no login in last {cfg.active_login_days} days", running))
+    recon_rows = [[lbl, n, allocated, (n - target) if target is not None else ""]
+                  for lbl, n in recon]
+    if calc_on:
+        recon_rows += [[], [f"info: ServiceNow last calculated allocation at (UTC)",
+                            val(sub.get("last_allocation_cal_on")), "", ""],
+                       ["info: counted users CREATED after that calculation",
+                        n_new_after_calc, "", ""],
+                       ["info: remaining difference after removing them",
+                        recon[-1][1] - n_new_after_calc, allocated,
+                        (recon[-1][1] - n_new_after_calc - target) if target is not None else ""]]
     write_csv(cfg.path(f"{base}_reconciliation.csv"),
-              ["cumulative_filter", "users", "servicenow_allocated", "difference"],
-              [[lbl, n, allocated, (n - target) if target is not None else ""]
-               for lbl, n in recon])
+              ["cumulative_filter", "users", "servicenow_allocated", "difference"], recon_rows)
     counted = recon[-1][1]
     print(f"\n  {name}  [{method}]")
     for lbl, n in recon:
         print(f"    {lbl:<45}{n:>10,}" +
               (f"   vs ServiceNow {target:,}: {n - target:+,}" if target is not None else ""))
+    if calc_on:
+        print(f"    ServiceNow last calculated at {val(sub.get('last_allocation_cal_on'))} UTC; "
+              f"{n_new_after_calc:,} counted users were created after that "
+              f"-> adjusted diff {recon[-1][1] - n_new_after_calc - (target or 0):+,}")
     return [name, method, len(population), counted, allocated, val(sub.get("count")),
             (counted - target) if target is not None else "", n_custom, n_dormant,
             val(sub.get("meter_type")), f"{base}_users.csv"]
