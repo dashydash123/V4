@@ -65,6 +65,8 @@ OUT_USERS = os.path.join(SCRIPT_DIR, "servicenow_subscription_users.csv")
 OUT_USER_ROLES = os.path.join(SCRIPT_DIR, "servicenow_subscription_user_roles.csv")
 OUT_ROLE_MAP = os.path.join(SCRIPT_DIR, "servicenow_subscription_role_map.csv")
 OUT_SUBS = os.path.join(SCRIPT_DIR, "servicenow_subscriptions.json")
+OUT_DIAG = os.path.join(SCRIPT_DIR, "servicenow_diagnostics.txt")
+DIAG = []
 
 USER_HAS_ROLE_FIELDS = [
     "user", "role", "role.name", "inherited", "granted_by.name", "included_in_role.name",
@@ -286,41 +288,110 @@ def fetch_role_names(sn):
     return {r["sys_id"]: val(r.get("name")) for r in rows}
 
 
+def diag(msg):
+    DIAG.append(msg)
+    print("  " + msg)
+
+
+def describe_rows(name, rows):
+    if rows is None:
+        diag(f"{name}: NOT READABLE (HTTP error) - grant read ACL to the API user")
+        return
+    diag(f"{name}: {len(rows):,} rows returned")
+    if not rows:
+        diag(f"  -> 0 rows usually means the API user has no read ACL on {name} "
+             "(ServiceNow returns empty instead of an error)")
+        return
+    sample = {k: val(v) for k, v in rows[0].items() if val(v)}
+    DIAG.append(f"  fields: {', '.join(sorted(rows[0].keys()))}")
+    DIAG.append(f"  sample row: {json.dumps(sample)[:1500]}")
+
+
+def pick_field(rows, candidates, predicate=None):
+    """Return the first field name present (non-empty) in rows, from candidates or,
+    if predicate is given, any field whose values satisfy it."""
+    keys = set()
+    for r in rows[:500]:
+        keys.update(k for k, v in r.items() if val(v))
+    for c in candidates:
+        if c in keys:
+            return c
+    if predicate:
+        for k in sorted(keys):
+            if any(predicate(val(r.get(k))) for r in rows[:500]):
+                return k
+    return None
+
+
+def role_scope(role_name):
+    """x_abc_app.user -> x_abc_app ; u_role / global -> ''"""
+    return role_name.split(".", 1)[0] if role_name.startswith("x_") and "." in role_name else ""
+
+
 def build_role_map(sn, subs, role_names, role_types):
     """Returns list of dicts: sub_id, table_name, role_id, role_name, role_type, source."""
     print("\n[2/4] Subscription -> custom table -> role mapping")
     app_engine_ids = [sid for sid, s in subs.items()
                       if APP_ENGINE_KEYWORD.lower() in val(s.get("name")).lower()]
 
-    cti = sn.try_table("ua_custom_table_inventory",
-                       fields=["table_name", "license"], label="custom table inventory")
-    rtc = sn.try_table("license_role_to_custom_table",
-                       fields=["table_name", "sys_user_role", "license_role_type", "active"],
-                       label="role-to-custom-table")
+    # fetch ALL fields (small tables) so field names can be auto-detected
+    cti = sn.try_table("ua_custom_table_inventory", label="custom table inventory")
+    rtc = sn.try_table("license_role_to_custom_table", label="role-to-custom-table")
+    describe_rows("ua_custom_table_inventory", cti)
+    describe_rows("license_role_to_custom_table", rtc)
 
     mapping = []
-    if cti and rtc:
-        table_to_subs = defaultdict(set)
-        for r in cti:
-            lic, tbl = val(r.get("license")), val(r.get("table_name"))
-            if lic in subs:
-                table_to_subs[tbl].add((lic, "mapped"))
-            elif not lic and app_engine_ids:
-                for sid in app_engine_ids:
-                    table_to_subs[tbl].add((sid, "unmapped table (defaults to App Engine)"))
-        for r in rtc:
-            if r.get("active") not in (None, "") and not is_true(r.get("active")):
-                continue
-            tbl, rid = val(r.get("table_name")), val(r.get("sys_user_role"))
-            for sid, source in table_to_subs.get(tbl, ()):
-                mapping.append({
-                    "sub_id": sid, "table_name": tbl, "role_id": rid,
-                    "role_name": role_names.get(rid, rid),
-                    "role_type": role_types.get(val(r.get("license_role_type")),
-                                                val(r.get("license_role_type"))),
-                    "source": source})
-    else:
-        print("  Falling back to database view license_details_assoc_roles")
+
+    # ---- table -> subscription (from custom table inventory) ----
+    table_to_subs = defaultdict(set)
+    if cti:
+        sub_f = pick_field(cti, ["license", "subscription", "license_details"],
+                           predicate=lambda v: v in subs)
+        tbl_f = pick_field(cti, ["table_name", "name", "table"])
+        diag(f"custom table inventory: subscription field='{sub_f}', table field='{tbl_f}'")
+        if tbl_f:
+            matched = unmapped = 0
+            for r in cti:
+                lic, tbl = val(r.get(sub_f)) if sub_f else "", val(r.get(tbl_f))
+                if lic in subs:
+                    table_to_subs[tbl].add((lic, "mapped"))
+                    matched += 1
+                elif not lic and app_engine_ids:
+                    for sid in app_engine_ids:
+                        table_to_subs[tbl].add((sid, "unmapped table (defaults to App Engine)"))
+                    unmapped += 1
+            diag(f"  tables mapped to target subscriptions: {matched:,}; "
+                 f"unmapped (counted to App Engine): {unmapped:,}")
+            other = {val(r.get(sub_f)) for r in cti if sub_f and val(r.get(sub_f))} - set(subs)
+            if other:
+                diag(f"  tables mapped to OTHER subscriptions: {len(other)} distinct "
+                     f"subscription ids (e.g. {sorted(other)[:3]})")
+
+    # ---- route A: role -> table (license_role_to_custom_table) ----
+    if table_to_subs and rtc:
+        role_f = pick_field(rtc, ["sys_user_role", "role"], predicate=lambda v: v in role_names)
+        tbl_f = pick_field(rtc, ["table_name", "table", "name"],
+                           predicate=lambda v: v in table_to_subs)
+        type_f = pick_field(rtc, ["license_role_type", "role_type"])
+        diag(f"role-to-custom-table: role field='{role_f}', table field='{tbl_f}', "
+             f"type field='{type_f}'")
+        if role_f and tbl_f:
+            for r in rtc:
+                if r.get("active") not in (None, "") and not is_true(r.get("active")):
+                    continue
+                tbl, rid = val(r.get(tbl_f)), val(r.get(role_f))
+                rtype = val(r.get(type_f)) if type_f else ""
+                for sid, source in table_to_subs.get(tbl, ()):
+                    mapping.append({
+                        "sub_id": sid, "table_name": tbl, "role_id": rid,
+                        "role_name": role_names.get(rid, rid),
+                        "role_type": role_types.get(rtype, rtype),
+                        "source": source})
+            diag(f"  route A (role-to-custom-table): {len(mapping):,} mappings")
+
+    # ---- route B: database view ----
+    if not mapping:
+        print("  Trying database view license_details_assoc_roles")
         q = "cti_licenseIN" + ",".join(subs)
         view = sn.try_table("license_details_assoc_roles", q,
                             fields=["cti_license", "cti_table_name", "ract_sys_user_role",
@@ -337,6 +408,25 @@ def build_role_map(sn, subs, role_names, role_types):
                 "role_type": role_types.get(val(r.get("ract_license_role_type")),
                                             val(r.get("ract_license_role_type"))),
                 "source": "mapped (view)"})
+        diag(f"  route B (assoc roles view): {len(mapping):,} mappings")
+
+    # ---- route C: custom role scope -> custom table scope ----
+    # x_abc_app.user grants access to tables x_abc_app_* ; if those tables are
+    # mapped to a target subscription, the role is attributed to it.
+    if not mapping and table_to_subs:
+        before = len(mapping)
+        for rid, rname in role_names.items():
+            scope = role_scope(rname)
+            if not scope:
+                continue
+            for tbl, sub_set in table_to_subs.items():
+                if tbl.startswith(scope + "_") or tbl == scope:
+                    for sid, source in sub_set:
+                        mapping.append({
+                            "sub_id": sid, "table_name": tbl, "role_id": rid,
+                            "role_name": rname, "role_type": "",
+                            "source": f"app scope match ({source})"})
+        diag(f"  route C (custom role scope -> table scope): {len(mapping) - before:,} mappings")
 
     # de-duplicate
     seen, out = set(), []
@@ -346,8 +436,14 @@ def build_role_map(sn, subs, role_names, role_types):
             seen.add(k)
             out.append(m)
     if not out:
-        print("  [WARN] no role mappings found for the target subscriptions.")
+        diag("[WARN] no role mappings found for the target subscriptions - see "
+             "servicenow_diagnostics.txt")
     return out
+
+
+def write_diagnostics():
+    with open(OUT_DIAG, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(DIAG) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -396,14 +492,20 @@ def main():
     sn.authenticate()
 
     subs = fetch_subscriptions(sn)
+    for sid, r in subs.items():
+        DIAG.append(f"subscription: {val(r.get('name'))} | sys_id {sid}")
     role_types = fetch_role_types(sn)
     role_names = fetch_role_names(sn)
+    DIAG.append(f"license_role_type rows: {len(role_types)} -> {sorted(set(role_types.values()))}")
+    DIAG.append(f"sys_user_role rows: {len(role_names):,} "
+                f"(custom x_/u_: {sum(1 for n in role_names.values() if is_custom_role(n)):,})")
     role_map = build_role_map(sn, subs, role_names, role_types)
 
     if not args.include_requester:
         before = len(role_map)
-        role_map = [m for m in role_map if m["role_type"].strip().lower() != "requester"]
-        print(f"  Dropped {before - len(role_map)} Requester-type role mappings")
+        role_map = [m for m in role_map if "requester" not in m["role_type"].strip().lower()]
+        diag(f"Dropped {before - len(role_map)} Requester-type role mappings "
+             f"({len(role_map)} left)")
 
     with open(OUT_ROLE_MAP, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -419,6 +521,9 @@ def main():
         role_to_maps[m["role_id"]].append(m)
 
     holders = fetch_role_holders(sn, role_to_maps.keys()) if role_to_maps else []
+    DIAG.append(f"sys_user_has_role rows for mapped roles (active users): {len(holders):,}")
+    if role_to_maps and not holders:
+        DIAG.append("  -> 0 rows: check the API user can read sys_user_has_role")
 
     print("\n[4/4] Building user files")
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
@@ -505,7 +610,9 @@ def main():
         for k in sorted(s):
             if any(t in k for t in ("alloc", "purchas", "count")) and val(s[k]):
                 print(f"    license_details.{k:<15}: {val(s[k])}")
-    print(f"\nWritten:\n  {OUT_USERS}\n  {OUT_USER_ROLES}\n  {OUT_ROLE_MAP}\n  {OUT_SUBS}")
+    write_diagnostics()
+    print(f"\nWritten:\n  {OUT_USERS}\n  {OUT_USER_ROLES}\n  {OUT_ROLE_MAP}\n  {OUT_SUBS}"
+          f"\n  {OUT_DIAG}")
 
 
 if __name__ == "__main__":
