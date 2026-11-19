@@ -89,6 +89,37 @@ def load_env(path):
             os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
+def normalise_instance(raw):
+    """Accepts 'abinbev', 'abinbev.service-now.com' or a full URL (with or
+    without a trailing path) and returns 'https://<host>'."""
+    raw = raw.strip().strip('"').strip("'")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urllib.parse.urlparse(raw)
+    host = parsed.hostname or ""
+    if host and "." not in host:            # bare instance name
+        host = f"{host}.service-now.com"
+    if not host:
+        sys.exit(f"[ERROR] SN_INSTANCE '{raw}' is not a valid host name")
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}"
+
+
+def check_dns(host):
+    import socket
+    if urllib.request.getproxies().get("https"):
+        return                              # proxy resolves the host for us
+    try:
+        socket.getaddrinfo(host, 443)
+    except socket.gaierror as e:
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "(none)"
+        sys.exit(
+            f"[ERROR] Cannot resolve host '{host}' ({e}).\n"
+            f"        - Is SN_INSTANCE right? Try:  nslookup {host}\n"
+            f"        - Is VPN / Zscaler connected?\n"
+            f"        - HTTPS_PROXY currently: {proxy}")
+
+
 def require(name):
     val = os.environ.get(name, "").strip()
     if not val:
@@ -101,8 +132,10 @@ def require(name):
 # --------------------------------------------------------------------------- #
 class ServiceNow:
     def __init__(self):
-        inst = require("SN_INSTANCE").rstrip("/")
-        self.base = inst if inst.startswith("http") else f"https://{inst}"
+        self.base = normalise_instance(require("SN_INSTANCE"))
+        self.host = urllib.parse.urlparse(self.base).hostname
+        print(f"ServiceNow instance: {self.base}")
+        check_dns(self.host)
         self.client_id = require("SN_CLIENT_ID")
         self.client_secret = require("SN_CLIENT_SECRET")
         self.refresh_token = require("SN_REFRESH_TOKEN")
@@ -125,6 +158,10 @@ class ServiceNow:
         except urllib.error.HTTPError as e:
             sys.exit(f"[ERROR] OAuth token request failed: HTTP {e.code} "
                      f"{e.read().decode(errors='replace')[:300]}")
+        except urllib.error.URLError as e:
+            sys.exit(f"[ERROR] Could not connect to {self.base}/oauth_token.do: {e.reason}\n"
+                     "        Check SN_INSTANCE, VPN/Zscaler, and HTTPS_PROXY if your "
+                     "network needs a proxy.")
         self.access_token = data["access_token"]
         if data.get("refresh_token"):
             self.refresh_token = data["refresh_token"]
