@@ -48,7 +48,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v5 (2026-11-19: chunked role lookup, 400 split/retry)"
+SCRIPT_VERSION = "v6 (2026-11-19: tolerant of single-record / error responses)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 TARGET_SKUS = [
@@ -208,11 +208,30 @@ class ServiceNow:
             }
             if fields:
                 params["sysparm_fields"] = ",".join(fields)
-            batch = self.get(f"/api/now/table/{table}", params).get("result", [])
+            resp = self.get(f"/api/now/table/{table}", params)
+            batch = resp.get("result", []) if isinstance(resp, dict) else resp
+            if isinstance(batch, dict):          # single record or error object
+                if "error" in batch or "message" in batch:
+                    DIAG.append(f"[WARN] {label}: ServiceNow returned an error object "
+                                f"at offset {offset}: {json.dumps(batch)[:300]}")
+                    batch = []
+                else:
+                    batch = [batch]
+            if not isinstance(batch, list):
+                DIAG.append(f"[WARN] {label}: unexpected response type "
+                            f"{type(batch).__name__} at offset {offset}")
+                batch = []
+            bad = [b for b in batch if not isinstance(b, dict)]
+            if bad:
+                DIAG.append(f"[WARN] {label}: dropped {len(bad)} non-record items "
+                            f"at offset {offset} (e.g. {str(bad[0])[:100]})")
+                batch = [b for b in batch if isinstance(b, dict)]
             rows.extend(batch)
             if not quiet:
                 print(f"  {label}: {len(rows):,} rows" + " " * 10, end="\r", flush=True)
-            if len(batch) < PAGE_SIZE:
+            raw_len = len(resp.get("result", [])) if isinstance(resp, dict) and \
+                isinstance(resp.get("result"), list) else len(batch)
+            if raw_len < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
         if not quiet:
@@ -623,6 +642,8 @@ def main():
     users = {}                          # (sub_id, user_id) -> aggregate
     detail_rows = []
     for h in holders:
+        if not isinstance(h, dict):
+            continue
         uid, rid = val(h.get("user")), val(h.get("role"))
         rname = val(h.get("role.name")) or role_names.get(rid, rid)
         inherited = is_true(h.get("inherited"))
