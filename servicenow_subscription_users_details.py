@@ -62,7 +62,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v10.1 (2026-11-20: as-of ServiceNow calculation file + calc-age warning)"
+SCRIPT_VERSION = "v10.2 (2026-11-20: + Subscription Management UI metric tables)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -376,7 +376,8 @@ def fetch_products(sn, cfg):
         sys.exit("[ERROR] license_details not readable - API user needs usage_admin / "
                  "sn_sub_man.admin (or admin).")
     cols = ["name", "meter_type", "license_type", "allocated", "count", "allocated_status",
-            "start_date", "end_date", "display_only", "expired", "product_code", "sys_id"]
+            "last_allocation_cal_on", "start_date", "end_date", "display_only", "expired",
+            "product_code", "sys_id"]
     write_csv(cfg.path("servicenow_available_products.csv"), cols,
               [[val(r.get(c)) for c in cols] for r in rows])
 
@@ -424,7 +425,49 @@ def fetch_products(sn, cfg):
             diag(msg)
     with open(cfg.path("servicenow_subscriptions.json"), "w", encoding="utf-8") as fh:
         json.dump(selected, fh, indent=2)
+    probe_ui_metrics(sn, cfg, selected)
     return selected
+
+
+UI_METRIC_TABLES = ["sn_sub_man_st_subscription_license_detail_metric",
+                    "sn_sub_man_st_subscription_insights",
+                    "sn_sub_man_subscription_detail_metric",
+                    "sn_sub_man_subscription_insights"]
+
+
+def probe_ui_metrics(sn, cfg, selected):
+    """Newer Subscription Management screens read from sn_sub_man_* tables, which can show
+    a different (real-time) figure from license_details.allocated. Pull any rows that point
+    at the selected subscriptions so both figures can be compared."""
+    ids = {r["sys_id"] for r in selected}
+    names = {val(r.get("name")).lower() for r in selected}
+    found = {}
+    for tbl in UI_METRIC_TABLES:
+        try:
+            rows = sn.table(tbl, "ORDERBYDESCsys_updated_on", label=tbl, quiet=True,
+                            limit=5000)
+        except urllib.error.HTTPError as e:
+            DIAG.append(f"  UI metric table {tbl}: HTTP {e.code} (not present / not readable)")
+            continue
+        hits = [r for r in rows
+                if any(val(v) in ids or val(v).lower() in names for v in r.values())]
+        DIAG.append(f"  UI metric table {tbl}: {len(rows):,} rows read, "
+                    f"{len(hits):,} for selected products")
+        if hits:
+            found[tbl] = hits
+    with open(cfg.path("servicenow_subscription_ui_metrics.json"), "w", encoding="utf-8") as fh:
+        json.dump(found, fh, indent=2)
+    if not found:
+        diag("Subscription Management UI tables: nothing found for these products "
+             "(see servicenow_diagnostics.txt)")
+        return
+    print("\n  Subscription Management UI tables (compare with license_details.allocated):")
+    for tbl, hits in found.items():
+        for r in hits[:6]:
+            nums = {k: val(v) for k, v in r.items()
+                    if re.fullmatch(r"\d{3,}", val(v) or "") and not k.startswith("sys_")}
+            when = val(r.get("sys_updated_on"))
+            print(f"    {tbl} | updated {when} UTC | {json.dumps(nums)[:240]}")
 
 
 def choose_method(cfg, sub):
