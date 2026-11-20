@@ -62,7 +62,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v10.2 (2026-11-20: + Subscription Management UI metric tables)"
+SCRIPT_VERSION = "v10.3 (2026-11-20: + sys_user counts, --counts-only)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -292,6 +292,21 @@ class ServiceNow:
         if not quiet:
             print(f"  {label}: {len(rows):,} rows" + " " * 10)
         return rows
+
+    def count(self, table, query):
+        """Record count without downloading rows: Aggregate API, else X-Total-Count header."""
+        try:
+            r = self.get(f"/api/now/stats/{table}", {"sysparm_count": "true",
+                                                     "sysparm_query": query})
+            return int(r["result"]["stats"]["count"])
+        except (urllib.error.HTTPError, KeyError, TypeError, ValueError):
+            pass
+        url = f"{self.base}/api/now/table/{table}?" + urllib.parse.urlencode(
+            {"sysparm_query": query, "sysparm_limit": 1, "sysparm_fields": "sys_id"})
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {self.access_token}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return int(resp.headers.get("X-Total-Count", "0"))
 
     def try_table(self, *args, **kwargs):
         try:
@@ -923,10 +938,58 @@ def write_asof_file(cfg, sub, population, cache, audit, held, role_names):
 
 
 # --------------------------------------------------------------------------- #
+# sys_user counts (no rows downloaded)
+# --------------------------------------------------------------------------- #
+def user_counts(sn, cfg, subs=None):
+    print("\n[sys_user counts]")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=cfg.active_login_days)
+              ).strftime("%Y-%m-%d %H:%M:%S")
+    rule = ("user_nameISNOTEMPTY^web_service_access_only!=true"
+            "^internal_integration_user!=true")
+    checks = [
+        ("All user records in sys_user", ""),
+        ("Inactive users (active = false)", "active=false"),
+        ("ACTIVE users (active = true)", "active=true"),
+        ("  active, customer contacts (CSM)", "active=true^sys_class_name=customer_contact"),
+        ("  active, internal users (not customer contacts)",
+         "active=true^sys_class_name!=customer_contact"),
+        ("  active, have logged in at least once", "active=true^last_login_timeISNOTEMPTY"),
+        ("  active, never logged in", "active=true^last_login_timeISEMPTY"),
+        (f"  active, logged in within last {cfg.active_login_days} days",
+         f"active=true^last_login_time>={cutoff}"),
+        ("  active, User ID + not web-service/integration",
+         f"active=true^{rule}"),
+        ("  active, User ID + not web-service/integration + logged in at least once",
+         f"active=true^{rule}^last_login_timeISNOTEMPTY"),
+        (f"  ServiceNow active-user rule (above + login within {cfg.active_login_days} days)",
+         f"active=true^{rule}^last_login_time>={cutoff}"),
+    ]
+    rows = []
+    for label, q in checks:
+        try:
+            n = sn.count("sys_user", q)
+        except urllib.error.HTTPError as e:
+            n = f"HTTP {e.code}"
+        rows.append([label.strip(), n, q])
+        print(f"  {label:<78}{n:>10,}" if isinstance(n, int) else f"  {label:<78}{n:>10}")
+    for sub in subs or []:
+        rows.append([f"ServiceNow allocated | {val(sub.get('name'))} "
+                     f"(calculated {val(sub.get('last_allocation_cal_on'))} UTC)",
+                     val(sub.get("allocated")), "license_details.allocated"])
+        print(f"  {'ServiceNow allocated | ' + val(sub.get('name'))[:52]:<78}"
+              f"{val(sub.get('allocated')):>10}")
+    write_csv(cfg.path("servicenow_user_counts.csv"),
+              ["count", "users", "sys_user encoded query"], rows)
+    print(f"  (login cutoff {cutoff} UTC; saved to servicenow_user_counts.csv)")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="ServiceNow per-product user extract")
     ap.add_argument("--env", default=os.path.join(SCRIPT_DIR, ".env"),
                     help="path to the .env file (default: .env next to this script)")
+    ap.add_argument("--counts-only", action="store_true",
+                    help="only print sys_user counts (takes seconds) and exit")
     args = ap.parse_args()
 
     print(f"servicenow_product_users {SCRIPT_VERSION}")
@@ -936,7 +999,20 @@ def main():
     sn = ServiceNow(cfg)
     now = datetime.now(timezone.utc)
 
+    if args.counts_only:
+        subs = []
+        try:
+            subs = [r for r in sn.table("license_details", "ORDERBYname",
+                                        fields=["name", "allocated", "last_allocation_cal_on"],
+                                        quiet=True)
+                    if any(p.lower() in val(r.get("name")).lower() for p in cfg.products)]
+        except urllib.error.HTTPError:
+            pass
+        user_counts(sn, cfg, subs)
+        return
+
     subs = fetch_products(sn, cfg)
+    user_counts(sn, cfg, subs)
     methods = {s["sys_id"]: choose_method(cfg, s) for s in subs}
 
     role_types = {r["sys_id"]: val(r.get("name")) for r in
