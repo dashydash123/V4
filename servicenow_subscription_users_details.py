@@ -62,7 +62,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v10 (2026-11-19: as-of ServiceNow calculation time file)"
+SCRIPT_VERSION = "v10.1 (2026-11-20: as-of ServiceNow calculation file + calc-age warning)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -414,6 +414,14 @@ def fetch_products(sn, cfg):
             slug(f"{n}_{val(r.get('start_date'))}_{r['sys_id'][:6]}")
         print(f"  - {n}  [{val(r.get('meter_type')) or val(r.get('license_type'))}]  "
               f"allocated {val(r.get('allocated'))} / purchased {val(r.get('count'))}")
+        calc = parse_dt(r.get("last_allocation_cal_on"))
+        if calc:
+            age_h = (datetime.now(timezone.utc) - calc).total_seconds() / 3600
+            msg = (f"    ServiceNow last calculated this at {val(r.get('last_allocation_cal_on'))} "
+                   f"UTC ({age_h:.1f} hours ago)")
+            if age_h > 24:
+                msg += " - OLDER THAN 24h: live counts will drift; use the _asof_ files"
+            diag(msg)
     with open(cfg.path("servicenow_subscriptions.json"), "w", encoding="utf-8") as fh:
         json.dump(selected, fh, indent=2)
     return selected
