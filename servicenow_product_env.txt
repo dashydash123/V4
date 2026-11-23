@@ -1,23 +1,70 @@
+# ============================================================================
+# servicenow_product_users.py  (v13)  -  settings
+# Keep comments on their own lines: anything after "=" is read as the value.
+# ============================================================================
+
+# ── ServiceNow connection ───────────────────────────────────────────────────
+# Bare instance name, full host or URL all work (abinbevww -> abinbevww.service-now.com)
 SN_INSTANCE=abinbevww
 SN_CLIENT_ID=
 SN_CLIENT_SECRET=
 SN_REFRESH_TOKEN=
+# Optional: used first if filled; refreshed automatically with the three values above
 SN_ACCESS_TOKEN=
 
-# Products to pull - separate with ;  (names as in output/servicenow_available_products.csv)
-SN_PRODUCTS=Strategic Portfolio Management Professional - User
+# ── Products to pull ────────────────────────────────────────────────────────
+# Separate with ;  (exact names as in output/servicenow_available_products.csv)
+# Leave empty to only write servicenow_available_products.csv and stop
+SN_PRODUCTS=App Engine Enterprise - Unrestricted User;Customer Service Management Standard - Unrestricted User v7
 
 # Take a product's users from group membership:  product=group1|group2 ; product2=group3
 SN_PRODUCT_GROUPS=
 
-# Optional
+# Force "every active user" counting for these products (Unrestricted User / Unlimited
+# meter types are detected automatically, so this is normally left empty)
 SN_ALL_USER_PRODUCTS=
+
+# ── Counting rules ──────────────────────────────────────────────────────────
+# ServiceNow login window for a user to count (documented rule: 365)
+SN_ACTIVE_LOGIN_DAYS=365
+# Dormant flag in the _users.csv files only (does not change any count)
 SN_DORMANT_DAYS=90
+# true = also exclude internal integration users (not in ServiceNow's documented rule)
+SN_EXCLUDE_INTEGRATION_USERS=false
+
+# ── Per-user subscriptions (not used by Unrestricted User products) ─────────
+# Leave SN_UHS_TABLE blank to auto-detect the user-has-subscription table
+SN_UHS_TABLE=
 SN_UHS_SUBSCRIPTION_FIELD=subscription
 SN_UHS_USER_FIELD=user
+
+# ── Paging and output ───────────────────────────────────────────────────────
 SN_PAGE_SIZE=1000
+# Relative paths are created under the script's folder
 SN_OUTPUT_DIR=output
 
-# Diagnostics script only
+# ── Flexera import files ────────────────────────────────────────────────────
+# asof = users counted at ServiceNow's last calculation (matches ServiceNow's figure)
+# live = users who count right now
+SN_FLEXERA_BASIS=asof
+# true = drop users without a valid email (same rule as the ADO script)
+SN_FLEXERA_SKIP_NO_EMAIL=true
+
+# ── Flexera push (same keys as the ADO script) ──────────────────────────────
+# no  = build servicenow_flexera_assignments.csv / _activities.csv only
+# yes = also push both files: token -> upload URL -> blob upload -> trigger import
+FLEXERA_PUSH=no
+FLEXERA_TOKEN_URL=
+FLEXERA_CLIENT_ID=
+FLEXERA_CLIENT_SECRET=
+FLEXERA_UPLOAD_URL=
+# Must contain {config_id}, as in the ADO .env
+FLEXERA_IMPORT_URL=
+# Each product is its own Flexera application with its own two import mappings.
+# Format:  product name=config id ; product name=config id   (names as in SN_PRODUCTS)
+FLEXERA_ASSIGNMENTS_CONFIG_IDS=App Engine Enterprise - Unrestricted User=;Customer Service Management Standard - Unrestricted User v7=
+FLEXERA_ACTIVITIES_CONFIG_IDS=App Engine Enterprise - Unrestricted User=;Customer Service Management Standard - Unrestricted User v7=
+
+# ── Separate diagnostics script only (ignored by servicenow_product_users.py) ─
 SN_DIAG_PRODUCT=Strategic Portfolio Management Professional
 SN_DIAG_GROUP=Brewassets - Requester (Creator/Editor)
