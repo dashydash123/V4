@@ -34,6 +34,16 @@ not internal integration user, logged in within SN_ACTIVE_LOGIN_DAYS (365).
   SN_UHS_USER_FIELD=user
   SN_PAGE_SIZE=1000
   SN_OUTPUT_DIR=output                     relative paths are under this script's folder
+  SN_EXCLUDE_INTEGRATION_USERS=false       true = also exclude internal integration users
+                                           (not in ServiceNow's documented rule; default off)
+  SN_FLEXERA_BASIS=asof                    asof = users counted at ServiceNow's last
+                                           calculation (matches ServiceNow's figure);
+                                           live = users who count right now
+  SN_FLEXERA_SKIP_NO_EMAIL=true            drop users without a valid email (as ADO script)
+  FLEXERA_PUSH=no                          yes = push both files to Flexera after building
+  FLEXERA_TOKEN_URL= / FLEXERA_CLIENT_ID= / FLEXERA_CLIENT_SECRET=
+  FLEXERA_UPLOAD_URL= / FLEXERA_IMPORT_URL=          (import URL contains {config_id})
+  FLEXERA_ASSIGNMENTS_CONFIG_ID= / FLEXERA_ACTIVITIES_CONFIG_ID=   ServiceNow mappings
   (SN_DIAG_* keys belong to the separate diagnostics script and are ignored here)
 
 Outputs (fixed names, overwritten every run) in SN_OUTPUT_DIR
@@ -45,6 +55,14 @@ Outputs (fixed names, overwritten every run) in SN_OUTPUT_DIR
   <Product_Name>_users.csv                 one row per user
   <Product_Name>_user_roles.csv            one row per user x custom role
   <Product_Name>_reconciliation.csv        filter-by-filter count vs ServiceNow allocated
+  <Product_Name>_asof_servicenow_calc.csv  users counted at ServiceNow's last calculation
+  <Product_Name>_asof_reconciliation.csv   live count -> as-of count, line by line
+  servicenow_flexera_assignments.csv       Flexera: email, user_id, License, account_created,
+                                           account_last_updated (plain UTF-8, no BOM)
+  servicenow_flexera_activities.csv        Flexera: user_id, last_active_date (ISO 8601 UTC)
+  servicenow_flexera_user_id_lookup.csv    user_id -> sys_id / user_name / email
+  servicenow_flexera_summary.csv           rows per subscription and what was removed
+  servicenow_user_counts.csv               sys_user counts under each definition
 
 Standard library only (works with the embeddable Python distribution).
 """
@@ -59,10 +77,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v10.3 (2026-11-20: + sys_user counts, --counts-only)"
+SCRIPT_VERSION = "v12 (2026-11-23: Flexera files in ADO-script format + optional push)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -76,7 +95,7 @@ MAX_RETRIES = 5
 
 USER_FIELDS = ["sys_id", "user_name", "name", "email", "active", "last_login_time",
                "web_service_access_only", "internal_integration_user", "locked_out",
-               "sys_class_name", "sys_created_on"]
+               "sys_class_name", "sys_created_on", "sys_updated_on"]
 HAS_ROLE_FIELDS = ["user", "role", "inherited", "granted_by.name", "included_in_role.name"]
 
 DIAG = []
@@ -110,6 +129,11 @@ def env_int(name, default):
         return int(env(name, str(default)))
     except ValueError:
         sys.exit(f"[ERROR] {name} must be a whole number")
+
+
+def env_bool(name, default):
+    v = env(name)
+    return default if not v else v.lower() in ("1", "true", "yes", "y")
 
 
 def parse_product_groups(raw):
@@ -147,6 +171,16 @@ class Config:
         self.uhs_sub_field = env("SN_UHS_SUBSCRIPTION_FIELD", "subscription")
         self.uhs_user_field = env("SN_UHS_USER_FIELD", "user")
         self.page_size = env_int("SN_PAGE_SIZE", 1000)
+        # ServiceNow documents only 3 exclusions (no User ID, web-service-only, no login in
+        # 365 days). Internal integration users are NOT excluded unless switched on here.
+        self.exclude_integration = env_bool("SN_EXCLUDE_INTEGRATION_USERS", False)
+        # Flexera import files
+        self.flexera_basis = env("SN_FLEXERA_BASIS", "asof").lower()
+        if self.flexera_basis not in ("asof", "live"):
+            sys.exit("[ERROR] SN_FLEXERA_BASIS must be asof or live")
+        self.flexera_skip_no_email = env_bool("SN_FLEXERA_SKIP_NO_EMAIL", True)
+        # push to Flexera (same keys as the ADO script); default: build files only
+        self.flexera_push = env("FLEXERA_PUSH", "no").lower() == "yes"
         out = env("SN_OUTPUT_DIR", "output")
         self.output_dir = out if os.path.isabs(out) else os.path.join(SCRIPT_DIR, out)
         os.makedirs(self.output_dir, exist_ok=True)
@@ -360,8 +394,8 @@ def diag(msg):
     print("  " + msg)
 
 
-def write_csv(path, header, rows):
-    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+def write_csv(path, header, rows, bom=True):
+    with open(path, "w", newline="", encoding="utf-8-sig" if bom else "utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(header)
         w.writerows(rows)
@@ -697,7 +731,7 @@ def classify(u, cfg, now):
         reason = "empty_user_id"
     elif is_true(u.get("web_service_access_only")):
         reason = "web_service_access_only"
-    elif is_true(u.get("internal_integration_user")):
+    elif cfg.exclude_integration and is_true(u.get("internal_integration_user")):
         reason = "internal_integration_user"
     elif last is None:
         reason = "never_logged_in"
@@ -709,8 +743,10 @@ def classify(u, cfg, now):
     return reason, days, dormant
 
 
-RECON_STEPS = ["empty_user_id", "web_service_access_only", "internal_integration_user",
-               "never_logged_in"]
+def recon_steps(cfg):
+    return (["empty_user_id", "web_service_access_only"]
+            + (["internal_integration_user"] if cfg.exclude_integration else [])
+            + ["never_logged_in"])
 
 
 def write_product_files(cfg, sub, method, population, extra, held, role_names,
@@ -722,6 +758,7 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
     sub_role_ids = set(sub_roles)
 
     user_rows, role_rows, reason_count = [], [], defaultdict(int)
+    counted_users = []
     calc_on = parse_dt(sub.get("last_allocation_cal_on"))
     n_new_after_calc = 0
     n_custom = n_dormant = 0
@@ -729,6 +766,8 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
         uid = u["sys_id"]
         reason, days, dormant = classify(u, cfg, now)
         reason_count[reason] += 1
+        if not reason:
+            counted_users.append(u)
         created = parse_dt(u.get("sys_created_on"))
         if calc_on and not reason and created and created > calc_on:
             n_new_after_calc += 1
@@ -747,7 +786,7 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
             name, method, uid, val(u.get("user_name")), val(u.get("name")),
             val(u.get("email")), val(u.get("sys_class_name")), val(u.get("sys_created_on")),
             val(u.get("last_login_time")), days, dormant, val(u.get("web_service_access_only")),
-            "N" if reason else "Y", reason,
+            val(u.get("internal_integration_user")), "N" if reason else "Y", reason,
             "Y" if custom_all else "N", ";".join(for_product), ";".join(custom_all),
             short_list(tables), short_list(how, 3), extra.get(uid, "")])
         for r in roles:
@@ -764,7 +803,8 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
     write_csv(cfg.path(f"{base}_users.csv"), [
         "product", "method", "user_sys_id", "user_name", "name", "email", "user_class",
         "sys_created_on", "last_login_time", "days_since_login", f"dormant_{cfg.dormant_days}d",
-        "web_service_access_only", "counts_toward_allocation", "exclusion_reason",
+        "web_service_access_only", "internal_integration_user", "counts_toward_allocation",
+        "exclusion_reason",
         "has_custom_role", "custom_roles_for_product", "all_custom_roles",
         "custom_tables_for_product", "role_assignment", "source_detail"], user_rows)
     write_csv(cfg.path(f"{base}_user_roles.csv"), [
@@ -779,7 +819,7 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
               "web_service_access_only": "excluding Web service access only",
               "internal_integration_user": "excluding internal integration users",
               "never_logged_in": "excluding never logged in"}
-    for st in RECON_STEPS:
+    for st in recon_steps(cfg):
         running -= reason_count[st]
         recon.append((labels[st], running))
     running -= reason_count[f"no_login_last_{cfg.active_login_days}d"]
@@ -798,16 +838,14 @@ def write_product_files(cfg, sub, method, population, extra, held, role_names,
               ["cumulative_filter", "users", "servicenow_allocated", "difference"], recon_rows)
     counted = recon[-1][1]
     print(f"\n  {name}  [{method}]")
+    print(f"    LIVE COUNT (users who count right now)")
     for lbl, n in recon:
-        print(f"    {lbl:<45}{n:>10,}" +
+        print(f"      {lbl:<52}{n:>10,}" +
               (f"   vs ServiceNow {target:,}: {n - target:+,}" if target is not None else ""))
-    if calc_on:
-        print(f"    ServiceNow last calculated at {val(sub.get('last_allocation_cal_on'))} UTC; "
-              f"{n_new_after_calc:,} counted users were created after that "
-              f"-> adjusted diff {recon[-1][1] - n_new_after_calc - (target or 0):+,}")
-    return [name, method, len(population), counted, allocated, val(sub.get("count")),
-            (counted - target) if target is not None else "", n_custom, n_dormant,
-            val(sub.get("meter_type")), f"{base}_users.csv"]
+    row = [name, method, len(population), counted, allocated, val(sub.get("count")),
+           (counted - target) if target is not None else "", n_custom, n_dormant,
+           val(sub.get("meter_type")), f"{base}_users.csv"]
+    return row, counted_users
 
 
 # --------------------------------------------------------------------------- #
@@ -839,7 +877,7 @@ def fetch_active_changes(sn, since):
     return react, deact
 
 
-def asof_status(u, calc_on, cfg, react):
+def asof_status(u, calc_on, cfg, react):  # noqa: C901
     """Return (counts_at_calc, status) for one user, judged at calc time."""
     created = parse_dt(u.get("sys_created_on"))
     if created and created > calc_on:
@@ -850,7 +888,7 @@ def asof_status(u, calc_on, cfg, react):
         return False, "empty_user_id"
     if is_true(u.get("web_service_access_only")):
         return False, "web_service_access_only"
-    if is_true(u.get("internal_integration_user")):
+    if cfg.exclude_integration and is_true(u.get("internal_integration_user")):
         return False, "internal_integration_user"
     last = parse_dt(u.get("last_login_time"))
     if last is None:
@@ -862,30 +900,54 @@ def asof_status(u, calc_on, cfg, react):
     return True, "counted"
 
 
-def write_asof_file(cfg, sub, population, cache, audit, held, role_names):
+def write_asof_file(cfg, sub, population, cache, audit, held, role_names, now):
+    """Rebuild the count as it stood at ServiceNow's last calculation and show, line by
+    line, how today's live count turns into that as-of count."""
     calc_on = parse_dt(sub.get("last_allocation_cal_on"))
     if not calc_on:
         diag(f"[WARN] {val(sub.get('name'))}: no last_allocation_cal_on - as-of file skipped")
-        return None
+        return None, []
     react, deact = audit
     base, name = sub["_slug"], val(sub.get("name"))
     allocated = val(sub.get("allocated"))
     target = int(allocated) if allocated.isdigit() else None
+    calc_txt = val(sub.get("last_allocation_cal_on"))
 
     candidates = list(population)
     if deact:
         active_ids = {u["sys_id"] for u in population}
         candidates += [u for u in cache.get(sorted(deact - active_ids))]
 
-    counts = defaultdict(int)
-    rows = []
+    counts, rows, asof_users = defaultdict(int), [], []
+    live_total = 0
+    bridge = defaultdict(int)          # label -> signed count
     for u in candidates:
+        is_active_now = is_true(u.get("active"))
+        live_reason = classify(u, cfg, now)[0] if is_active_now else "inactive_now"
+        live_ok = not live_reason
+        live_total += live_ok
         ok, status = asof_status(u, calc_on, cfg, react)
-        if deact and u["sys_id"] in deact and not is_true(u.get("active")):
-            status = "deactivated_after_calc (counted at calc)" if ok else status
+        if deact and u["sys_id"] in deact and not is_active_now and ok:
+            status = "deactivated_after_calc (counted at calc)"
         counts[status] += 1
+
+        # bridge: why the user is in one count but not the other
+        if live_ok and not ok:
+            bridge[{"created_after_calc": "created after the calculation",
+                     "reactivated_after_calc": "reactivated after the calculation"}
+                   .get(status, f"other: {status}")] -= 1
+        elif ok and not live_ok:
+            if status.startswith("deactivated_after_calc"):
+                bridge["deactivated after the calculation (were counted)"] += 1
+            elif live_reason.startswith("no_login_last_"):
+                bridge[f"login was within {cfg.active_login_days} days at calc time, "
+                       f"has aged out since"] += 1
+            else:
+                bridge[f"other: {live_reason}"] += 1
+
         if not ok:
             continue
+        asof_users.append(u)
         roles = held.get(u["sys_id"], {})
         custom = sorted(role_names.get(r, r) for r in roles
                         if is_custom_role(role_names.get(r, r)))
@@ -901,40 +963,59 @@ def write_asof_file(cfg, sub, population, cache, audit, held, role_names):
 
     n = len(rows)
     after = counts["logged_in_after_calc (assumed counted)"]
-    lines = [
-        ("ServiceNow calculation time (UTC, from API)", val(sub.get("last_allocation_cal_on"))),
-        ("As-of count (rows in _asof_servicenow_calc.csv)", n),
-        ("ServiceNow allocated", allocated),
-        ("Difference", (n - target) if target is not None else ""),
-        ("", ""),
-        ("of which: counted, last login before calc", counts["counted"]),
-        ("of which: logged in after calc (assumed counted)", after),
-        ("of which: deactivated after calc, added back",
-         counts["deactivated_after_calc (counted at calc)"]),
-        ("excluded: created after calc", counts["created_after_calc"]),
-        ("excluded: reactivated after calc", counts["reactivated_after_calc"]),
-        ("excluded: empty User ID", counts["empty_user_id"]),
-        ("excluded: Web service access only", counts["web_service_access_only"]),
-        ("excluded: internal integration user", counts["internal_integration_user"]),
-        ("excluded: never logged in", counts["never_logged_in"]),
-        (f"excluded: no login in {cfg.active_login_days} days before calc",
-         counts[f"no_login_{cfg.active_login_days}d_before_calc"]),
-        ("", ""),
-        ("note", "Users who logged in after calc are kept: their earlier login is "
-                 "overwritten, so a first-ever login after calc can't be told apart. "
-                 "That group is the only remaining uncertainty."),
-    ]
+    order = ["created after the calculation", "reactivated after the calculation",
+             "deactivated after the calculation (were counted)",
+             f"login was within {cfg.active_login_days} days at calc time, has aged out since"]
+    bridge_lines = [(k, bridge[k]) for k in order if bridge.get(k)] + \
+                   [(k, v) for k, v in sorted(bridge.items()) if k not in order and v]
+    check = live_total + sum(v for _, v in bridge_lines)
+    if check != n:
+        diag(f"[WARN] {name}: as-of bridge does not add up ({check} vs {n})")
+
+    # ---- console
+    print(f"\n    AS OF SERVICENOW'S CALCULATION ({calc_txt} UTC) - live count adjusted back")
+    print(f"      {'Live count now':<62}{live_total:>10,}")
+    for k, v in bridge_lines:
+        sign = "-" if v < 0 else "+"
+        print(f"      {sign} {k:<60}{v:>+10,}")
+    print(f"      {'= As-of count':<62}{n:>10,}" +
+          (f"   vs ServiceNow {target:,}: {n - target:+,}" if target is not None else ""))
+    print(f"        {'of which: last login before the calculation':<60}"
+          f"{counts['counted'] + counts['deactivated_after_calc (counted at calc)']:>10,}")
+    print(f"        {'of which: logged in after it (assumed already counted)':<60}{after:>10,}")
     if react is None:
-        lines.append(("note", "sys_audit not readable: reactivations/deactivations after "
-                              "calc were NOT adjusted"))
-    write_csv(cfg.path(f"{base}_asof_reconciliation.csv"), ["item", "value"], lines)
-    print(f"    As of ServiceNow calc {val(sub.get('last_allocation_cal_on'))} UTC: "
-          f"{n:,} users" + (f"  vs {target:,}: {n - target:+,}" if target is not None else "") +
-          f"  (created after {counts['created_after_calc']:,}, reactivated after "
-          f"{counts['reactivated_after_calc']:,}, deactivated after added back "
-          f"{counts['deactivated_after_calc (counted at calc)']:,}, logged in after "
-          f"{after:,})")
-    return n
+        print("      NOTE: sys_audit not readable - reactivations/deactivations not adjusted")
+
+    # ---- CSV
+    lines = [("ServiceNow calculation time (UTC, from API)", calc_txt, ""),
+             ("Live count now", live_total, "")]
+    lines += [(("minus: " if v < 0 else "plus: ") + k, v, "") for k, v in bridge_lines]
+    lines += [("= As-of count (rows in _asof_servicenow_calc.csv)", n, ""),
+              ("ServiceNow allocated", allocated, ""),
+              ("Difference", (n - target) if target is not None else "", ""),
+              ("", "", ""),
+              ("of which: last login before the calculation",
+               counts["counted"] + counts["deactivated_after_calc (counted at calc)"], ""),
+              ("of which: logged in after the calculation (assumed already counted)", after,
+               "Their earlier login is overwritten, so a first-ever login after the "
+               "calculation can't be told apart - the only remaining uncertainty"),
+              ("", "", ""),
+              ("excluded at calc time: created after", counts["created_after_calc"], ""),
+              ("excluded at calc time: reactivated after", counts["reactivated_after_calc"], ""),
+              ("excluded at calc time: empty User ID", counts["empty_user_id"], ""),
+              ("excluded at calc time: Web service access only",
+               counts["web_service_access_only"], ""),
+              ("excluded at calc time: never logged in", counts["never_logged_in"], ""),
+              (f"excluded at calc time: no login in {cfg.active_login_days} days before",
+               counts[f"no_login_{cfg.active_login_days}d_before_calc"], "")]
+    if cfg.exclude_integration:
+        lines.append(("excluded at calc time: internal integration user",
+                      counts["internal_integration_user"], "SN_EXCLUDE_INTEGRATION_USERS=true"))
+    if react is None:
+        lines.append(("note", "", "sys_audit not readable: reactivations/deactivations after "
+                                  "the calculation were NOT adjusted"))
+    write_csv(cfg.path(f"{base}_asof_reconciliation.csv"), ["item", "users", "note"], lines)
+    return n, asof_users
 
 
 # --------------------------------------------------------------------------- #
@@ -944,8 +1025,9 @@ def user_counts(sn, cfg, subs=None):
     print("\n[sys_user counts]")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=cfg.active_login_days)
               ).strftime("%Y-%m-%d %H:%M:%S")
-    rule = ("user_nameISNOTEMPTY^web_service_access_only!=true"
-            "^internal_integration_user!=true")
+    rule = "user_nameISNOTEMPTY^web_service_access_only!=true" + \
+        ("^internal_integration_user!=true" if cfg.exclude_integration else "")
+    ws = "not web-service/integration" if cfg.exclude_integration else "not web-service-only"
     checks = [
         ("All user records in sys_user", ""),
         ("Inactive users (active = false)", "active=false"),
@@ -957,9 +1039,10 @@ def user_counts(sn, cfg, subs=None):
         ("  active, never logged in", "active=true^last_login_timeISEMPTY"),
         (f"  active, logged in within last {cfg.active_login_days} days",
          f"active=true^last_login_time>={cutoff}"),
-        ("  active, User ID + not web-service/integration",
-         f"active=true^{rule}"),
-        ("  active, User ID + not web-service/integration + logged in at least once",
+        ("  active, internal integration users (counted unless switched off)",
+         "active=true^internal_integration_user=true"),
+        (f"  active, User ID + {ws}", f"active=true^{rule}"),
+        (f"  active, User ID + {ws} + logged in at least once",
          f"active=true^{rule}^last_login_timeISNOTEMPTY"),
         (f"  ServiceNow active-user rule (above + login within {cfg.active_login_days} days)",
          f"active=true^{rule}^last_login_time>={cutoff}"),
@@ -981,6 +1064,163 @@ def user_counts(sn, cfg, subs=None):
     write_csv(cfg.path("servicenow_user_counts.csv"),
               ["count", "users", "sys_user encoded query"], rows)
     print(f"  (login cutoff {cutoff} UTC; saved to servicenow_user_counts.csv)")
+
+
+# --------------------------------------------------------------------------- #
+# Flexera SaaS data import files (user assignments + user activities)
+# --------------------------------------------------------------------------- #
+# Headers must match the CSV field names in the Flexera mappings EXACTLY
+#   User assignments : Email address of the user = email | Unique user identifier = user_id
+#                      Subscription name = License | User account creation = account_created
+#                      User account last updated = account_last_updated
+#   User activities  : Unique user identifier = user_id
+#                      Activity or event name + Activity recorded value = last_active_date
+ASSIGNMENT_COLS = ["email", "user_id", "License", "account_created", "account_last_updated"]
+ACTIVITY_COLS = ["user_id", "last_active_date"]
+ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
+# something@domain.tld -> no spaces, exactly one @, a dot in the domain (same as ADO script)
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s.]{2,}$")
+
+
+def is_valid_email(v):
+    return bool(EMAIL_RE.match((v or "").strip()))
+
+
+def make_user_id(sys_id, subscription):
+    """Stable 36-char UUID, unique per user per subscription; same inputs -> same ID every
+    run (same approach as the ADO script)."""
+    key = f"{sys_id}|{subscription}".strip().lower()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
+def iso(v):
+    d = parse_dt(v)
+    return d.strftime(ISO_FMT) if d else ""
+
+
+def write_flexera_files(cfg, picks):
+    """picks: list of (sub, users, basis). One file per import type covering every selected
+    product; License = subscription name exactly as in ServiceNow."""
+    print("\n[Flexera import files]")
+    assign, latest, lookup, summary = [], {}, [], []
+    seen = set()
+    for sub, users, basis in picks:
+        name = val(sub.get("name"))
+        n_assign = n_never = bad_email = 0
+        samples = []
+        for u in users:
+            email = val(u.get("email")).strip()
+            if cfg.flexera_skip_no_email and not is_valid_email(email):
+                bad_email += 1
+                if len(samples) < 5:
+                    samples.append(f"{val(u.get('user_name'))} | {email!r}")
+                continue
+            uid = make_user_id(u["sys_id"], name)
+            if (uid, name) in seen:
+                continue
+            seen.add((uid, name))
+            assign.append([email, uid, name, iso(u.get("sys_created_on")),
+                           iso(u.get("sys_updated_on"))])
+            lookup.append([uid, u["sys_id"], val(u.get("user_name")), email, name, basis])
+            n_assign += 1
+            ts = iso(u.get("last_login_time"))
+            if ts:
+                if uid not in latest or ts > latest[uid]:
+                    latest[uid] = ts
+            else:
+                n_never += 1      # assignment only -> Flexera shows 'No activity'
+        n_act = n_assign - n_never
+        summary.append([name, basis, len(users), n_assign, n_act, n_never, bad_email,
+                        val(sub.get("allocated")), val(sub.get("last_allocation_cal_on"))])
+        print(f"  {name[:60]:<60} basis={basis:<5} users {len(users):>8,}  "
+              f"assignments {n_assign:>8,}  activities {n_act:>8,}")
+        if bad_email:
+            print(f"    removed {bad_email:,} users with an invalid email")
+            for smp in samples:
+                print(f"      e.g. {smp}")
+        if n_never:
+            print(f"    {n_never:,} never logged in: in assignments, not in activities")
+
+    activities = [[u, t] for u, t in latest.items()]
+    write_csv(cfg.path("servicenow_flexera_assignments.csv"), ASSIGNMENT_COLS, assign, bom=False)
+    write_csv(cfg.path("servicenow_flexera_activities.csv"), ACTIVITY_COLS, activities, bom=False)
+    write_csv(cfg.path("servicenow_flexera_user_id_lookup.csv"),
+              ["user_id", "sys_id", "user_name", "email", "License", "basis"], lookup)
+    write_csv(cfg.path("servicenow_flexera_summary.csv"),
+              ["License", "basis", "users", "assignment_rows", "activity_rows",
+               "never_logged_in", "removed_invalid_email", "servicenow_allocated",
+               "servicenow_calculated_utc"], summary)
+    print(f"  Assignments: {len(assign):,} rows | Activities: {len(activities):,} rows")
+    print("  -> servicenow_flexera_assignments.csv, servicenow_flexera_activities.csv "
+          "(+ _user_id_lookup.csv, _summary.csv)")
+    return cfg.path("servicenow_flexera_assignments.csv"), \
+        cfg.path("servicenow_flexera_activities.csv"), len(assign), len(activities)
+
+
+# ── Flexera API push (same flow and .env keys as the ADO script) ───────────────
+def flexera_cfg(key):
+    v = env(key)
+    if not v or v.startswith("PASTE_"):
+        sys.exit(f"[flexera] {key} is missing in .env")
+    return v
+
+
+def http_json(method, url, headers=None, data=None, timeout=60):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode() or "{}"
+            return resp.status, (json.loads(body) if body.strip().startswith("{") else {})
+    except urllib.error.HTTPError as e:
+        return e.code, {"_error": http_error_text(e)}
+
+
+def flexera_token():
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": flexera_cfg("FLEXERA_CLIENT_ID"),
+        "client_secret": flexera_cfg("FLEXERA_CLIENT_SECRET")}).encode()
+    code, data = http_json("POST", flexera_cfg("FLEXERA_TOKEN_URL"),
+                           {"Content-Type": "application/x-www-form-urlencoded"}, body, 30)
+    if code in (400, 401):
+        sys.exit("[flexera] Token refused. Check FLEXERA_CLIENT_ID / FLEXERA_CLIENT_SECRET.")
+    if code >= 300 or "access_token" not in data:
+        sys.exit(f"[flexera] Token request failed: HTTP {code} {data.get('_error', '')}")
+    print("[flexera] Access token obtained")
+    return data["access_token"]
+
+
+def flexera_push(token, csv_path, config_id, label):
+    print(f"[flexera] Pushing {label} ({os.path.basename(csv_path)})")
+    auth = {"Authorization": f"Bearer {token}"}
+    code, data = http_json("POST", flexera_cfg("FLEXERA_UPLOAD_URL"), auth, b"", 30)
+    if code >= 300 or "url" not in data:
+        sys.exit(f"[flexera] Upload URL request failed: HTTP {code} {data.get('_error', '')}")
+    print(f"          upload URL received (fileId={data.get('fileId')})")
+    with open(csv_path, "rb") as fh:
+        code, err = http_json("PUT", data["url"], {"x-ms-blob-type": "BlockBlob",
+                                                   "Content-Type": "text/csv"}, fh.read(), 300)
+    if code >= 300:
+        sys.exit(f"[flexera] Blob upload failed: HTTP {code} {err.get('_error', '')}")
+    print(f"          uploaded to blob (HTTP {code})")
+    code, err = http_json("POST", flexera_cfg("FLEXERA_IMPORT_URL").replace("{config_id}",
+                                                                           config_id),
+                          {**auth, "Content-Type": "application/json"},
+                          json.dumps({"fileId": data["fileId"]}).encode(), 60)
+    if code >= 300:
+        sys.exit(f"[flexera] Import trigger failed: HTTP {code} {err.get('_error', '')}")
+    print(f"          import task created (HTTP {code})")
+
+
+def push_flexera(assign_csv, activity_csv, n_assign, n_act):
+    token = flexera_token()
+    if n_assign:
+        flexera_push(token, assign_csv, flexera_cfg("FLEXERA_ASSIGNMENTS_CONFIG_ID"),
+                     "user assignments")
+    if n_act:
+        flexera_push(token, activity_csv, flexera_cfg("FLEXERA_ACTIVITIES_CONFIG_ID"),
+                     "user activities")
+    print("[flexera] Done. Check Flexera > Data imports > ServiceNow.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1036,6 +1276,7 @@ def main():
     cache = UserCache(sn)
     summary = []
     audit_cache = {"since": None, "data": (None, None)}
+    flexera_picks = []
     for sub in subs:
         sid, name = sub["sys_id"], val(sub.get("name"))
         method, extra = methods[sid], {}
@@ -1061,18 +1302,26 @@ def main():
                      f"to the table your other script uses.")
                 population = cache.get(ids)
         print(f"\n[5/6] Writing files for {name}")
-        row = write_product_files(cfg, sub, method, population, extra, held,
-                                  role_names, by_sub.get(sid, {}), now)
-        asof_n = ""
+        row, live_users = write_product_files(cfg, sub, method, population, extra, held,
+                                              role_names, by_sub.get(sid, {}), now)
+        asof_n, asof_users = None, []
         if method == "all_active" and parse_dt(sub.get("last_allocation_cal_on")):
             calc_on = parse_dt(sub.get("last_allocation_cal_on"))
             if audit_cache.get("since") is None or calc_on < audit_cache["since"]:
                 audit_cache["since"] = calc_on
                 audit_cache["data"] = fetch_active_changes(sn, calc_on)
-            asof_n = write_asof_file(cfg, sub, population, cache, audit_cache["data"],
-                                     held, role_names)
+            asof_n, asof_users = write_asof_file(cfg, sub, population, cache,
+                                                 audit_cache["data"], held, role_names, now)
         row.insert(4, asof_n if asof_n is not None else "")
         summary.append(row)
+        if cfg.flexera_basis == "asof" and asof_n is not None:
+            flexera_picks.append((sub, asof_users, "asof"))
+        else:
+            if cfg.flexera_basis == "asof":
+                diag(f"{name}: no as-of count available ({method}) - Flexera files use live")
+            flexera_picks.append((sub, live_users, "live"))
+
+    flex = write_flexera_files(cfg, flexera_picks)
 
     print("\n[6/6] Summary")
     write_csv(cfg.path("servicenow_summary.csv"), [
@@ -1086,7 +1335,14 @@ def main():
         asof = f"as-of calc {row[4]:>9,}  " if isinstance(row[4], int) else ""
         print(f"  {row[0]:<60} {row[1]:<10} live {row[3]:>9,}  {asof}"
               f"ServiceNow {row[5]:>8}")
+    print(f"  Integration users: {'EXCLUDED (SN_EXCLUDE_INTEGRATION_USERS=true)' if cfg.exclude_integration else 'counted (ServiceNow documented rule)'}"
+          f" | Flexera files use: {cfg.flexera_basis.upper()} count")
     print(f"\nFiles written to {cfg.output_dir}")
+    if cfg.flexera_push:
+        print()
+        push_flexera(*flex)
+    else:
+        print("[flexera] FLEXERA_PUSH is not 'yes' - files built, nothing sent to Flexera")
 
 
 if __name__ == "__main__":
