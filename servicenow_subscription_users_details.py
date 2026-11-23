@@ -43,7 +43,8 @@ not internal integration user, logged in within SN_ACTIVE_LOGIN_DAYS (365).
   FLEXERA_PUSH=no                          yes = push both files to Flexera after building
   FLEXERA_TOKEN_URL= / FLEXERA_CLIENT_ID= / FLEXERA_CLIENT_SECRET=
   FLEXERA_UPLOAD_URL= / FLEXERA_IMPORT_URL=          (import URL contains {config_id})
-  FLEXERA_ASSIGNMENTS_CONFIG_ID= / FLEXERA_ACTIVITIES_CONFIG_ID=   ServiceNow mappings
+  FLEXERA_ASSIGNMENTS_CONFIG_IDS=Product A=<id>;Product B=<id>   one Flexera application
+  FLEXERA_ACTIVITIES_CONFIG_IDS=Product A=<id>;Product B=<id>    per product
   (SN_DIAG_* keys belong to the separate diagnostics script and are ignored here)
 
 Outputs (fixed names, overwritten every run) in SN_OUTPUT_DIR
@@ -57,9 +58,9 @@ Outputs (fixed names, overwritten every run) in SN_OUTPUT_DIR
   <Product_Name>_reconciliation.csv        filter-by-filter count vs ServiceNow allocated
   <Product_Name>_asof_servicenow_calc.csv  users counted at ServiceNow's last calculation
   <Product_Name>_asof_reconciliation.csv   live count -> as-of count, line by line
-  servicenow_flexera_assignments.csv       Flexera: email, user_id, License, account_created,
+  <Product_Name>_flexera_assignments.csv   Flexera: email, user_id, License, account_created,
                                            account_last_updated (plain UTF-8, no BOM)
-  servicenow_flexera_activities.csv        Flexera: user_id, last_active_date (ISO 8601 UTC)
+  <Product_Name>_flexera_activities.csv    Flexera: user_id, last_active_date (ISO 8601 UTC)
   servicenow_flexera_user_id_lookup.csv    user_id -> sys_id / user_name / email
   servicenow_flexera_summary.csv           rows per subscription and what was removed
   servicenow_user_counts.csv               sys_user counts under each definition
@@ -81,7 +82,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "v12 (2026-11-23: Flexera files in ADO-script format + optional push)"
+SCRIPT_VERSION = "v13 (2026-11-23: one Flexera application per product - split files/configs)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CUSTOM_ROLE_PREFIXES = ("x_", "u_")
@@ -1099,14 +1100,15 @@ def iso(v):
 
 
 def write_flexera_files(cfg, picks):
-    """picks: list of (sub, users, basis). One file per import type covering every selected
-    product; License = subscription name exactly as in ServiceNow."""
-    print("\n[Flexera import files]")
-    assign, latest, lookup, summary = [], {}, [], []
-    seen = set()
+    """picks: list of (sub, users, basis). Each product is its own Flexera application, so
+    each gets its own assignments + activities files. License = subscription name exactly
+    as in ServiceNow."""
+    print("\n[Flexera import files - one pair per product / Flexera application]")
+    lookup, summary, outputs = [], [], []
     for sub, users, basis in picks:
-        name = val(sub.get("name"))
-        n_assign = n_never = bad_email = 0
+        name, base = val(sub.get("name")), sub["_slug"]
+        assign, latest, seen = [], {}, set()
+        n_never = bad_email = 0
         samples = []
         for u in users:
             email = val(u.get("email")).strip()
@@ -1116,24 +1118,32 @@ def write_flexera_files(cfg, picks):
                     samples.append(f"{val(u.get('user_name'))} | {email!r}")
                 continue
             uid = make_user_id(u["sys_id"], name)
-            if (uid, name) in seen:
+            if uid in seen:
                 continue
-            seen.add((uid, name))
+            seen.add(uid)
             assign.append([email, uid, name, iso(u.get("sys_created_on")),
                            iso(u.get("sys_updated_on"))])
             lookup.append([uid, u["sys_id"], val(u.get("user_name")), email, name, basis])
-            n_assign += 1
             ts = iso(u.get("last_login_time"))
             if ts:
                 if uid not in latest or ts > latest[uid]:
                     latest[uid] = ts
             else:
                 n_never += 1      # assignment only -> Flexera shows 'No activity'
-        n_act = n_assign - n_never
-        summary.append([name, basis, len(users), n_assign, n_act, n_never, bad_email,
-                        val(sub.get("allocated")), val(sub.get("last_allocation_cal_on"))])
+        activities = [[u, t] for u, t in latest.items()]
+        a_path = cfg.path(f"{base}_flexera_assignments.csv")
+        v_path = cfg.path(f"{base}_flexera_activities.csv")
+        write_csv(a_path, ASSIGNMENT_COLS, assign, bom=False)
+        write_csv(v_path, ACTIVITY_COLS, activities, bom=False)
+        outputs.append({"sub": sub, "name": name, "assign_path": a_path, "act_path": v_path,
+                        "n_assign": len(assign), "n_act": len(activities)})
+        summary.append([name, basis, len(users), len(assign), len(activities), n_never,
+                        bad_email, val(sub.get("allocated")),
+                        val(sub.get("last_allocation_cal_on")),
+                        os.path.basename(a_path), os.path.basename(v_path)])
         print(f"  {name[:60]:<60} basis={basis:<5} users {len(users):>8,}  "
-              f"assignments {n_assign:>8,}  activities {n_act:>8,}")
+              f"assignments {len(assign):>8,}  activities {len(activities):>8,}")
+        print(f"    -> {os.path.basename(a_path)}, {os.path.basename(v_path)}")
         if bad_email:
             print(f"    removed {bad_email:,} users with an invalid email")
             for smp in samples:
@@ -1141,20 +1151,13 @@ def write_flexera_files(cfg, picks):
         if n_never:
             print(f"    {n_never:,} never logged in: in assignments, not in activities")
 
-    activities = [[u, t] for u, t in latest.items()]
-    write_csv(cfg.path("servicenow_flexera_assignments.csv"), ASSIGNMENT_COLS, assign, bom=False)
-    write_csv(cfg.path("servicenow_flexera_activities.csv"), ACTIVITY_COLS, activities, bom=False)
     write_csv(cfg.path("servicenow_flexera_user_id_lookup.csv"),
               ["user_id", "sys_id", "user_name", "email", "License", "basis"], lookup)
     write_csv(cfg.path("servicenow_flexera_summary.csv"),
               ["License", "basis", "users", "assignment_rows", "activity_rows",
                "never_logged_in", "removed_invalid_email", "servicenow_allocated",
-               "servicenow_calculated_utc"], summary)
-    print(f"  Assignments: {len(assign):,} rows | Activities: {len(activities):,} rows")
-    print("  -> servicenow_flexera_assignments.csv, servicenow_flexera_activities.csv "
-          "(+ _user_id_lookup.csv, _summary.csv)")
-    return cfg.path("servicenow_flexera_assignments.csv"), \
-        cfg.path("servicenow_flexera_activities.csv"), len(assign), len(activities)
+               "servicenow_calculated_utc", "assignments_file", "activities_file"], summary)
+    return outputs
 
 
 # ── Flexera API push (same flow and .env keys as the ADO script) ───────────────
@@ -1212,15 +1215,59 @@ def flexera_push(token, csv_path, config_id, label):
     print(f"          import task created (HTTP {code})")
 
 
-def push_flexera(assign_csv, activity_csv, n_assign, n_act):
+def parse_config_map(raw):
+    """'Product A=ID1;Product B=ID2' -> {'product a': 'ID1', 'product b': 'ID2'}"""
+    out = {}
+    for part in raw.split(";"):
+        if "=" in part:
+            prod, cid = part.split("=", 1)
+            if prod.strip() and cid.strip() and not cid.strip().startswith("PASTE_"):
+                out[prod.strip().lower()] = cid.strip()
+    return out
+
+
+def config_for(sub, mapping, single_key):
+    for key in (val(sub.get("name")).lower(), sub.get("_requested_as", "").lower()):
+        if key and key in mapping:
+            return mapping[key]
+    single = env(single_key)
+    return single if single and not single.startswith("PASTE_") else ""
+
+
+def push_flexera(outputs):
+    """Each product -> its own Flexera application, with its own two import configs.
+    All config IDs are checked before anything is sent, so a run never half-pushes."""
+    a_map = parse_config_map(env("FLEXERA_ASSIGNMENTS_CONFIG_IDS"))
+    v_map = parse_config_map(env("FLEXERA_ACTIVITIES_CONFIG_IDS"))
+    plan, missing = [], []
+    for o in outputs:
+        a_id = config_for(o["sub"], a_map, "FLEXERA_ASSIGNMENTS_CONFIG_ID")
+        v_id = config_for(o["sub"], v_map, "FLEXERA_ACTIVITIES_CONFIG_ID")
+        if (o["n_assign"] and not a_id) or (o["n_act"] and not v_id):
+            missing.append(o["name"])
+        plan.append((o, a_id, v_id))
+    if missing:
+        sys.exit("[flexera] No config ID for: " + "; ".join(missing) +
+                 "\n          Add them to FLEXERA_ASSIGNMENTS_CONFIG_IDS / "
+                 "FLEXERA_ACTIVITIES_CONFIG_IDS as  product name=config id ; ...")
+    used = defaultdict(list)
+    for o, a_id, v_id in plan:
+        used[("assignments", a_id)].append(o["name"])
+        used[("activities", v_id)].append(o["name"])
+    shared = [f"{k[0]} config {k[1]}: {', '.join(v)}" for k, v in used.items()
+              if k[1] and len(v) > 1]
+    if shared:
+        sys.exit("[flexera] The same config ID is set for more than one product - each "
+                 "product is meant to be its own Flexera application:\n  " + "\n  ".join(shared))
+
     token = flexera_token()
-    if n_assign:
-        flexera_push(token, assign_csv, flexera_cfg("FLEXERA_ASSIGNMENTS_CONFIG_ID"),
-                     "user assignments")
-    if n_act:
-        flexera_push(token, activity_csv, flexera_cfg("FLEXERA_ACTIVITIES_CONFIG_ID"),
-                     "user activities")
-    print("[flexera] Done. Check Flexera > Data imports > ServiceNow.")
+    for o, a_id, v_id in plan:
+        print(f"[flexera] {o['name']}")
+        if o["n_assign"]:
+            flexera_push(token, o["assign_path"], a_id, "user assignments")
+        if o["n_act"]:
+            flexera_push(token, o["act_path"], v_id, "user activities")
+    print("[flexera] Done. Check Flexera > Data imports for each application.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1321,7 +1368,7 @@ def main():
                 diag(f"{name}: no as-of count available ({method}) - Flexera files use live")
             flexera_picks.append((sub, live_users, "live"))
 
-    flex = write_flexera_files(cfg, flexera_picks)
+    flex_outputs = write_flexera_files(cfg, flexera_picks)
 
     print("\n[6/6] Summary")
     write_csv(cfg.path("servicenow_summary.csv"), [
@@ -1340,7 +1387,7 @@ def main():
     print(f"\nFiles written to {cfg.output_dir}")
     if cfg.flexera_push:
         print()
-        push_flexera(*flex)
+        push_flexera(flex_outputs)
     else:
         print("[flexera] FLEXERA_PUSH is not 'yes' - files built, nothing sent to Flexera")
 
