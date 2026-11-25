@@ -21,6 +21,7 @@ script, else .env). Command-line flags override the env file:
     python anaplan_elp_report.py --env my.env
     python anaplan_elp_report.py --input "Anaplan Subscription Per User.xlsx" --sheet "Anaplan Subscription Per Us (2)"
     python anaplan_elp_report.py --exclude-leavers no
+    python anaplan_elp_report.py --variant-sheets no      (GHQ file gets only 'GHQ - All')
 
 Report tables are Excel formulas (COUNTIFS on the 'User Data' sheet), and the
 Settings sheet holds the report date, inactivity threshold and the
@@ -127,6 +128,9 @@ class Config:
         self.zone_group_prefixes = env_list("ZONE_GROUP_PREFIXES", "GHQ")
         self.zone_include_analysis = env_bool("ZONE_INCLUDE_ANALYSIS", True)
         self.zone_combined_sheet = env_bool("ZONE_ADD_COMBINED_SHEET", True)
+        self.zone_variant_sheets = env_bool("ZONE_VARIANT_SHEETS", True)
+        if args.variant_sheets is not None:
+            self.zone_variant_sheets = args.variant_sheets == "yes"
 
         self.inactivity_days = env_int("INACTIVITY_DAYS", 120)
         excl = args.exclude_leavers if args.exclude_leavers is not None else None
@@ -899,6 +903,26 @@ def group_zones(records):
     return groups
 
 
+def write_zone_sheets(wb, used, group, recs, zones, cfg, src):
+    """Writes the zone sheet(s) for one zone group; returns the sheet names written.
+    Multi-variant groups (GHQ): '<group> - All' and/or one sheet per variant,
+    controlled by ZONE_ADD_COMBINED_SHEET and ZONE_VARIANT_SHEETS."""
+    written = []
+    if len(zones) > 1:
+        combined = cfg.zone_combined_sheet or not cfg.zone_variant_sheets
+        if combined:
+            ws = wb.create_sheet(safe_sheet_name(f"{group} - All", used))
+            write_source_format(ws, src, [r["raw"] for r in recs])
+            written.append(ws.title)
+        if not cfg.zone_variant_sheets:
+            return written
+    for z in zones:
+        ws = wb.create_sheet(safe_sheet_name(z, used))
+        write_source_format(ws, src, [r["raw"] for r in recs if r["zone"] == z])
+        written.append(ws.title)
+    return written
+
+
 def print_summary(records, cfg, lts, uts):
     print(f"\nELP summary (as of {cfg.report_date:%d/%m/%Y}, threshold {cfg.inactivity_days} days, "
           f"leavers {'EXCLUDED from' if cfg.exclude_leavers else 'INCLUDED in'} inactivity)")
@@ -924,6 +948,8 @@ def main():
     ap.add_argument("--sheet", help="Input sheet name (overrides INPUT_SHEET)")
     ap.add_argument("--output-dir", help="Output folder (overrides OUTPUT_DIR)")
     ap.add_argument("--report-name", help="Report file name (overrides REPORT_FILE_NAME)")
+    ap.add_argument("--variant-sheets", choices=["yes", "no"],
+                    help="One sheet per GHQ variant (yes) or only 'GHQ - All' (no); overrides ZONE_VARIANT_SHEETS")
     ap.add_argument("--exclude-leavers", choices=["yes", "no"],
                     help="Exclude leavers from the inactivity count (overrides env)")
     args = ap.parse_args()
@@ -961,31 +987,20 @@ def main():
         for g, (recs, zones) in groups.items():
             zwb = Workbook()
             zwb.remove(zwb.active)
-            used = set()
-            if len(zones) > 1 and cfg.zone_combined_sheet:
-                write_source_format(zwb.create_sheet(safe_sheet_name(f"{g} - All", used)),
-                                    src, [r["raw"] for r in recs])
-            for z in zones:
-                write_source_format(zwb.create_sheet(safe_sheet_name(z, used)),
-                                    src, [r["raw"] for r in recs if r["zone"] == z])
+            sheets = write_zone_sheets(zwb, set(), g, recs, zones, cfg, src)
             if cfg.zone_include_analysis:
                 z_lts = ordered({r["lt"] for r in recs}, cfg.license_types)
                 build_analysis_workbook(zwb, src, recs, cfg, g, z_lts, uts, zone_breakdown=len(zones) > 1)
             path = os.path.join(out_dir, f"{cfg.zone_prefix}{safe_file_part(g)}.xlsx")
             save_wb(zwb, path)
-            extra = f" ({len(zones)} zone sheets: {', '.join(zones)})" if len(zones) > 1 else ""
+            extra = f" (sheets: {', '.join(sheets)})" if len(zones) > 1 else ""
             print(f"Wrote {path}  - {len(recs):,} users{extra}")
     elif cfg.zone_mode == "single_file":
         zwb = Workbook()
         zwb.remove(zwb.active)
         used = set()
         for g, (recs, zones) in groups.items():
-            if len(zones) > 1 and cfg.zone_combined_sheet:
-                write_source_format(zwb.create_sheet(safe_sheet_name(f"{g} - All", used)),
-                                    src, [r["raw"] for r in recs])
-            for z in zones:
-                write_source_format(zwb.create_sheet(safe_sheet_name(z, used)),
-                                    src, [r["raw"] for r in recs if r["zone"] == z])
+            write_zone_sheets(zwb, used, g, recs, zones, cfg, src)
         path = os.path.join(out_dir, cfg.zone_single_file)
         save_wb(zwb, path)
         print(f"Wrote {path}  - {len(zwb.sheetnames)} zone sheets")
